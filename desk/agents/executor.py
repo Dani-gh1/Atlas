@@ -1,108 +1,151 @@
-"""Executor: udfører PAPIR-ordrer på en virtuel konto.
-
-Regler: fast procent af kontoen pr. handel, simuleret slippage (+ halv spread)
-og kommission, maks. antal åbne positioner, karantæne efter salg og ingen
-handler i de første minutter efter åbning. Der findes INGEN forbindelse til en
-rigtig mægler – Executor ændrer kun tal i papirbogen (state.json).
-"""
+"""Executor: papir-udførsel. Fast risiko i % pr. handel, spread/glid/swap, maks. positioner,
+karantæne efter lukning, og styring af åbne positioner (stop, trailing, mål, weekend)."""
 from __future__ import annotations
 
-import math
-from datetime import date, datetime, timedelta
+import itertools
+from datetime import datetime, timedelta
 
-from ..models import Fill, Order
+from .. import accounts, config, market
+from ..models import Account, ExecutionResult, Position, RiskDecision
+
+_ids = itertools.count(1)
+_M15 = timedelta(minutes=15)
+
+
+def _iso(t: datetime) -> str:
+    return t.isoformat(timespec="seconds")
 
 
 class Executor:
-    name = "Executor"
+    name = "executor"
 
-    def __init__(self, cfg, logger=None, notifier=None):
-        self.cfg = cfg
-        self.log = logger
-        self.notify = notifier
+    # ---------------------------------------------------------------- åbning
+    def run(self, decision: RiskDecision, acc: Account, params, quotes: dict,
+            now: datetime) -> ExecutionResult:
+        def no(reason):
+            return ExecutionResult(decision, False, reason)
 
-    def commission(self, qty: float, price: float) -> float:
-        c = self.cfg
-        fee = max(c.COMMISSION_MIN, qty * c.COMMISSION_PER_SHARE)
-        return min(fee, qty * price * c.COMMISSION_MAX_PCT)
+        if not decision.approved:
+            return no("afvist af Risk: " + decision.reason)
+        intent = decision.intent
+        sym = intent.signal.instrument
+        if len(acc.positions) >= params.max_positions:
+            return no(f"maks. {params.max_positions} åbne positioner")
+        until = acc.quarantine.get(sym)
+        if until and until > _iso(now):
+            return no(f"karantæne til {until[11:16]} UTC")
+        q = quotes.get(sym)
+        if q is None:
+            return no("ingen kurs")
+        ins = market.instrument(sym)
+        eq = accounts.equity(acc, quotes)
+        uq = accounts.usd_per_unit(ins.quote, quotes)
+        risk_usd = eq * decision.risk_pct / 100.0
+        units = risk_usd / (decision.stop_distance * uq)
+        # gearingsloft pr. instrument og nominel eksponering pr. valuta
+        notional = accounts.notional_usd(units, sym, q.mid, quotes)
+        max_notional = ins.max_leverage * eq * 0.5
+        if notional > max_notional:
+            units *= max_notional / notional
+            notional = max_notional
+        exp = accounts.currency_exposure(acc, quotes, eq)
+        s = accounts.sign(intent.direction)
+        for ccy, k in ((ins.base, s), (ins.quote, -s)):
+            n = exp.get(ccy, (0.0, 0.0))[1] + k * notional / eq
+            if abs(n) > config.MAX_CCY_NOTIONAL_X:
+                return no(f"nominel {ccy}-eksponering {abs(n):.1f}x > {config.MAX_CCY_NOTIONAL_X}x")
+        if units <= 0:
+            return no("størrelse nul")
+        entry = q.ask if intent.direction == "long" else q.bid
+        stop = entry - s * decision.stop_distance
+        tp = entry + s * decision.take_profit_distance if decision.take_profit_distance else None
+        actual_risk_pct = units * decision.stop_distance * uq / eq * 100
+        pos = Position(
+            id=f"{intent.strategy}-{now:%Y%m%d%H%M}-{next(_ids)}", strategy=intent.strategy,
+            instrument=sym, direction=intent.direction, units=round(units, 4), entry=entry,
+            stop=stop, initial_stop=stop, take_profit=tp, trail_distance=decision.trail_distance,
+            trail_activate=decision.trail_activate, opened_at=_iso(now),
+            risk_pct=round(actual_risk_pct, 4), score=intent.score, best_price=entry,
+            last_checked=_iso(now))
+        acc.positions.append(pos)
+        cost = accounts.pct(units * q.spread * uq)
+        return ExecutionResult(decision, True, "udført (papir)", pos.id, entry, pos.units, cost)
 
-    def slip(self, price: float, side: str, spread_pct: float | None) -> float:
-        frac = self.cfg.SLIPPAGE_BPS / 1e4 + (spread_pct or 0.0) / 2
-        return price * (1 + frac) if side == "buy" else price * (1 - frac)
+    # ---------------------------------------------------------------- styring
+    def manage(self, acc: Account, md, quotes: dict, now: datetime, params, news=None) -> list:
+        closed = []
+        mtc = market.minutes_to_close(now)
+        for pos in list(acc.positions):
+            q = quotes.get(pos.instrument)
+            if q is None:
+                continue
+            hs = q.spread / 2
+            slip = q.spread * config.SLIPPAGE_SPREAD_FRAC
+            s = accounts.sign(pos.direction)
+            exit_px, why = None, ""
+            last = datetime.fromisoformat(pos.last_checked)
+            for c in md.candles(pos.instrument, "M15")[-40:]:
+                close_t = c.time + _M15
+                if close_t <= last or close_t > now:
+                    continue
+                if s > 0:
+                    lo, hi, op = c.low - hs, c.high - hs, c.open - hs
+                    if lo <= pos.stop:
+                        exit_px, why = min(pos.stop, op) - slip, self._stop_label(pos)
+                    elif pos.take_profit and hi >= pos.take_profit:
+                        exit_px, why = pos.take_profit, "gevinstmål"
+                    else:
+                        pos.best_price = max(pos.best_price, hi)
+                else:
+                    lo, hi, op = c.low + hs, c.high + hs, c.open + hs
+                    if hi >= pos.stop:
+                        exit_px, why = max(pos.stop, op) + slip, self._stop_label(pos)
+                    elif pos.take_profit and lo <= pos.take_profit:
+                        exit_px, why = pos.take_profit, "gevinstmål"
+                    else:
+                        pos.best_price = min(pos.best_price, lo)
+                if exit_px is not None:
+                    break
+                if pos.trail_distance and s * (pos.best_price - pos.entry) >= pos.trail_activate:
+                    new = pos.best_price - s * pos.trail_distance
+                    if s * (new - pos.stop) > 0:
+                        pos.stop = new
+            pos.last_checked = _iso(now)
+            if exit_px is None:
+                held_h = (now - datetime.fromisoformat(pos.opened_at)).total_seconds() / 3600
+                if mtc is not None and mtc <= config.CLOSE_BEFORE_WEEKEND_MIN and market.ny(now).weekday() == 4:
+                    exit_px, why = accounts.exit_price(pos.direction, q), "lukket før weekend"
+                elif held_h >= params.max_hold_hours:
+                    exit_px, why = accounts.exit_price(pos.direction, q), "maks. holdetid"
+                elif news is not None and params.flat_before_news_min:
+                    near = news.nearest(pos.instrument, now)
+                    if near and 0 <= near[0] <= params.flat_before_news_min:
+                        exit_px, why = accounts.exit_price(pos.direction, q), f"lukket før nyhed: {near[1].title}"
+            if exit_px is not None:
+                closed.append(self.close(acc, pos, exit_px, why, quotes, now, params))
+        return closed
 
     @staticmethod
-    def in_quarantine(account: dict, sym: str, today: date) -> bool:
-        until = account.get("quarantine", {}).get(sym)
-        return bool(until and today.isoformat() < until)
+    def _stop_label(pos: Position) -> str:
+        return "trailing stop" if pos.stop != pos.initial_stop else "stop"
 
-    def buy(self, order: Order, account: dict, equity: float, now: datetime, strat,
-            minutes_since_open: float | None = None, fill_price: float | None = None):
-        cfg = self.cfg
-        today = now.date()
-        if minutes_since_open is not None and minutes_since_open < cfg.NO_TRADE_FIRST_MINUTES:
-            return None, "første minut efter åbning"
-        if order.symbol in account["positions"]:
-            return None, "position findes allerede"
-        if len(account["positions"]) >= strat.p("max_positions", cfg):
-            return None, "maks. antal positioner"
-        if self.in_quarantine(account, order.symbol, today):
-            return None, "karantæne efter salg"
-        px = self.slip(fill_price if fill_price is not None else order.ref_price, "buy", order.spread_pct)
-        budget = min(equity * strat.p("position_pct", cfg), account["cash"])
-        qty = budget / px
-        qty = math.floor(qty * 1e4) / 1e4 if cfg.FRACTIONAL_SHARES else math.floor(qty)
-        if qty <= 0:
-            return None, "ikke nok kontanter"
-        fee = self.commission(qty, px)
-        if qty * px + fee > account["cash"]:
-            qty = (account["cash"] - fee) / px
-            qty = math.floor(qty * 1e4) / 1e4 if cfg.FRACTIONAL_SHARES else math.floor(qty)
-            if qty <= 0:
-                return None, "ikke nok kontanter"
-            fee = self.commission(qty, px)
-        cost = qty * px + fee
-        account["cash"] -= cost
-        # Stoppet flyttes med den faktiske fyldkurs (samme afstand som Risk satte).
-        dist = order.ref_price - order.stop if order.stop else 0
-        account["positions"][order.symbol] = {
-            "qty": qty, "entry": px, "cost": cost, "stop": px - dist, "trail": None,
-            "trail_mult": order.trail_mult, "atr": order.atr, "high": px, "sector": order.sector,
-            "opened": now.isoformat(), "score": order.score, "reason": order.reason,
+    def close(self, acc: Account, pos: Position, price: float, why: str, quotes: dict,
+              now: datetime, params) -> dict:
+        gross = accounts.pnl_usd(pos, price, quotes)
+        realized = gross + pos.swap_paid
+        acc.balance += realized
+        acc.positions.remove(pos)
+        acc.trades += 1
+        if realized > 0:
+            acc.wins += 1
+        acc.quarantine[pos.instrument] = _iso(now + timedelta(minutes=params.quarantine_min))
+        risk_usd = abs(pos.entry - pos.initial_stop) * pos.units * accounts.usd_per_unit(
+            market.instrument(pos.instrument).quote, quotes)
+        return {
+            "id": pos.id, "strategy": pos.strategy, "instrument": pos.instrument,
+            "direction": pos.direction, "opened_at": pos.opened_at, "closed_at": _iso(now),
+            "entry": pos.entry, "exit": price, "reason": why, "score": pos.score,
+            "risk_pct": pos.risk_pct, "pnl_pct": accounts.pct(realized),
+            "swap_pct": accounts.pct(pos.swap_paid),
+            "r_multiple": round(realized / risk_usd, 3) if risk_usd else 0.0,
         }
-        fill = Fill(order.strategy, order.symbol, "buy", qty, round(px, 4), round(fee, 4),
-                    round(px - (fill_price or order.ref_price), 4), order.reason, now.isoformat())
-        self._record(fill, equity)
-        return fill, "ok"
-
-    def sell(self, order: Order, account: dict, now: datetime, fill_price: float | None = None,
-             spread_pct: float | None = None) -> Fill | None:
-        pos = account["positions"].pop(order.symbol, None)
-        if pos is None:
-            return None
-        ref = fill_price if fill_price is not None else order.ref_price
-        px = self.slip(ref, "sell", spread_pct)
-        fee = self.commission(pos["qty"], px)
-        proceeds = pos["qty"] * px - fee
-        account["cash"] += proceeds
-        pnl = proceeds / pos["cost"] - 1 if pos["cost"] else 0.0
-        account.setdefault("quarantine", {})[order.symbol] = (
-            now.date() + timedelta(days=self.cfg.QUARANTINE_DAYS)).isoformat()
-        account["trades"] = account.get("trades", 0) + 1
-        account["wins"] = account.get("wins", 0) + (1 if pnl > 0 else 0)
-        opened = date.fromisoformat(pos["opened"][:10])
-        fill = Fill(order.strategy, order.symbol, "sell", pos["qty"], round(px, 4), round(fee, 4),
-                    round(ref - px, 4), order.reason, now.isoformat(), round(pnl, 6),
-                    (now.date() - opened).days)
-        self._record(fill, None, pos)
-        return fill
-
-    def _record(self, fill: Fill, equity: float | None, pos: dict | None = None):
-        if self.log:
-            weight = (fill.qty * fill.price / equity) if equity else None
-            self.log.trade(fill, weight)
-        if self.notify and self.cfg.NTFY_ON_TRADES:
-            if fill.side == "buy":
-                msg = f"KØB {fill.symbol} ({fill.strategy}) @ {fill.price:.2f} – {fill.reason}"
-            else:
-                msg = f"SALG {fill.symbol} ({fill.strategy}) {fill.pnl_pct * 100:+.2f} % – {fill.reason}"
-            self.notify.send(msg, title="Papirdesk handel", tags="chart_with_upwards_trend")

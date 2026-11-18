@@ -1,6 +1,5 @@
+var/
 __pycache__/
 *.pyc
-data/
+*.sqlite3*
 state.json
-state.epoch-*.json
-.state-*.json

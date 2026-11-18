@@ -1,303 +1,215 @@
-"""Gratis datakilder (kun stdlib):
+"""Markedsdata: datakilder (OANDA practice, Twelve Data, syntetisk) og cache.
 
-* Yahoo Finance chart-endpoint (v8): dagsbarer og intradag-kurser/volumen.
-* Nasdaq.com API: bid/ask (spread) og earnings-kalender.
-* NasdaqTrader RSS: aktuelle handelsstop (halts).
-
-Alle kald går gennem en simpel hastighedsbegrænser med genforsøg. Dagsbarer
-caches på disk, så botten kun henter fuld historik én gang pr. handelsdag.
+Sikkerhed: HTTP-klienten kan KUN lave GET-kald. Der findes ingen kode der opretter ordrer.
 """
 from __future__ import annotations
 
+import bisect
 import json
-import threading
-import time
-import urllib.error
+import time as _time
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
-from .models import Bar, Snapshot
+from . import config, market
+from .models import Candle, Quote
 
-UA = "Mozilla/5.0 (X11; Linux x86_64) papirdesk/1.0"
-YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?{qs}"
-NASDAQ_INFO = "https://api.nasdaq.com/api/quote/{sym}/info?assetclass={cls}"
-NASDAQ_EARNINGS = "https://api.nasdaq.com/api/calendar/earnings?date={d}"
-HALTS_RSS = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+UTC = timezone.utc
+TF_MINUTES = {"M15": 15, "H1": 60, "H4": 240}
 
 
-class Http:
-    def __init__(self, rps: float = 4.0, timeout: float = 15, retries: int = 3):
-        self.min_interval = 1.0 / rps if rps > 0 else 0
-        self.timeout = timeout
-        self.retries = retries
-        self._lock = threading.Lock()
-        self._next = 0.0
-
-    def _wait(self):
-        with self._lock:
-            now = time.monotonic()
-            wait = self._next - now
-            self._next = max(now, self._next) + self.min_interval
-        if wait > 0:
-            time.sleep(wait)
-
-    def get_text(self, url: str, headers: dict | None = None) -> str:
-        last: Exception | None = None
-        for attempt in range(self.retries):
-            self._wait()
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*", **(headers or {})})
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    return r.read().decode("utf-8", "replace")
-            except urllib.error.HTTPError as e:
-                last = e
-                if e.code in (400, 401, 403, 404):
-                    break
-                time.sleep(1.5 * (2 ** attempt))
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-                last = e
-                time.sleep(1.0 * (2 ** attempt))
-        raise RuntimeError(f"GET {url} fejlede: {last}")
-
-    def get_json(self, url: str, headers: dict | None = None):
-        return json.loads(self.get_text(url, headers))
+class DataError(RuntimeError):
+    pass
 
 
-def yahoo_symbol(sym: str) -> str:
-    return sym.replace(".", "-")
-
-
-def parse_yahoo_daily(payload: dict, tz: ZoneInfo) -> list[Bar]:
-    res = payload["chart"]["result"][0]
-    ts = res.get("timestamp") or []
-    q = res["indicators"]["quote"][0]
-    adj = (res["indicators"].get("adjclose") or [{}])[0].get("adjclose")
-    bars = []
-    for i, t in enumerate(ts):
-        o, h, l, c, v = (q[k][i] for k in ("open", "high", "low", "close", "volume"))
-        if None in (o, h, l, c):
-            continue
-        # Juster OHLC for splits/udbytte med adjclose-forholdet, så indikatorer ikke springer.
-        f = (adj[i] / c) if adj and adj[i] and c else 1.0
-        d = datetime.fromtimestamp(t, tz).date().isoformat()
-        bars.append(Bar(d, o * f, h * f, l * f, c * f, float(v or 0)))
-    # fjern dubletter (Yahoo kan sende dagens bar to gange)
-    dedup: dict[str, Bar] = {}
-    for b in bars:
-        dedup[b.date] = b
-    return list(dedup.values())
-
-
-class MarketData:
-    """Live-dataudbyder. Bygger Snapshot-objekter til agenterne."""
-
-    def __init__(self, cfg, clock, http: Http | None = None):
-        self.cfg = cfg
-        self.clock = clock
-        self.http = http or Http(cfg.REQUESTS_PER_SECOND, cfg.HTTP_TIMEOUT, cfg.HTTP_RETRIES)
-        self.tz = ZoneInfo(cfg.MARKET_TZ)
-        self.daily_dir = cfg.CACHE_DIR / "daily"
-        self.daily_dir.mkdir(parents=True, exist_ok=True)
-        self._earnings: dict[str, date] = {}
-        self._earnings_day: date | None = None
-        self.errors: list[str] = []
-
-    # --- dagsbarer ------------------------------------------------------------
-    def daily_bars(self, sym: str, rng: str | None = None, max_age_days: int = 0) -> list[Bar]:
-        """Afsluttede dagsbarer (dagens ufærdige bar fjernes i åbningstiden)."""
-        rng = rng or self.cfg.DAILY_HISTORY_RANGE
-        path = self.daily_dir / f"{sym}_{rng}.json"
-        st = self.clock.status()
-        today = st.now_market.date()
-        # Dagens bar er kun færdig når den regulære session er slut.
-        if st.is_trading_day and st.close_at and st.now_market < st.close_at:
-            complete = (today - timedelta(days=1)).isoformat()
-        else:
-            complete = today.isoformat()
-        if path.exists():
-            try:
-                data = json.loads(path.read_text())
-                fetched = date.fromisoformat(data["fetched"])
-                if (today - fetched).days <= max_age_days and data.get("complete_through", "") >= complete:
-                    return [b for b in (Bar(*x) for x in data["bars"]) if b.date <= complete]
-            except (ValueError, KeyError, TypeError):
-                pass
-        qs = urllib.parse.urlencode({"range": rng, "interval": "1d", "events": "div,split"})
-        payload = self.http.get_json(YAHOO_CHART.format(sym=yahoo_symbol(sym), qs=qs))
-        bars = parse_yahoo_daily(payload, self.tz)
-        path.write_text(json.dumps({"fetched": today.isoformat(), "complete_through": complete,
-                                    "bars": [[b.date, b.open, b.high, b.low, b.close, b.volume] for b in bars]}))
-        return [b for b in bars if b.date <= complete]
-
-    def bulk_daily(self, symbols: list[str], rng: str | None = None, max_age_days: int = 0) -> dict[str, list[Bar]]:
-        out: dict[str, list[Bar]] = {}
-
-        def one(s):
-            try:
-                return s, self.daily_bars(s, rng, max_age_days)
-            except Exception as e:  # noqa: BLE001
-                self.errors.append(f"{s}: {e}")
-                return s, None
-
-        with ThreadPoolExecutor(self.cfg.FETCH_WORKERS) as ex:
-            for s, bars in ex.map(one, symbols):
-                if bars:
-                    out[s] = bars
-        return out
-
-    # --- intradag -------------------------------------------------------------
-    def intraday(self, sym: str) -> dict | None:
-        qs = urllib.parse.urlencode({"range": "1d", "interval": "5m", "includePrePost": "false"})
-        payload = self.http.get_json(YAHOO_CHART.format(sym=yahoo_symbol(sym), qs=qs))
-        res = payload["chart"]["result"][0]
-        meta = res["meta"]
-        q = res["indicators"]["quote"][0]
-        ts = res.get("timestamp") or []
-        opens = [o for o in q.get("open", []) if o is not None]
-        vols = [v for v in q.get("volume", []) if v is not None]
-        highs = [h for h in q.get("high", []) if h is not None]
-        lows = [x for x in q.get("low", []) if x is not None]
-        price = meta.get("regularMarketPrice")
-        if not price:
-            return None
-        rmt = meta.get("regularMarketTime")
-        return {
-            "price": float(price),
-            "open": float(opens[0]) if opens else float(price),
-            "prev_close": float(meta.get("chartPreviousClose") or meta.get("previousClose") or price),
-            "day_high": float(meta.get("regularMarketDayHigh") or (max(highs) if highs else price)),
-            "day_low": float(meta.get("regularMarketDayLow") or (min(lows) if lows else price)),
-            "volume": float(meta.get("regularMarketVolume") or sum(vols)),
-            "last_trade_age_s": (time.time() - rmt) if rmt else None,
-            "bar_date": datetime.fromtimestamp(ts[0], self.tz).date().isoformat() if ts else None,
-        }
-
-    def bulk_intraday(self, symbols: list[str]) -> dict[str, dict]:
-        out = {}
-
-        def one(s):
-            try:
-                return s, self.intraday(s)
-            except Exception as e:  # noqa: BLE001
-                self.errors.append(f"{s}: {e}")
-                return s, None
-
-        with ThreadPoolExecutor(self.cfg.FETCH_WORKERS) as ex:
-            for s, d in ex.map(one, symbols):
-                if d:
-                    out[s] = d
-        return out
-
-    # --- Nasdaq: spread / earnings / halts --------------------------------------
-    def bid_ask(self, sym: str, is_etf: bool) -> tuple[float | None, float | None]:
-        url = NASDAQ_INFO.format(sym=urllib.parse.quote(sym.replace("-", ".")), cls="etf" if is_etf else "stocks")
-        try:
-            d = self.http.get_json(url, {"Accept": "application/json"})
-            pd = (d.get("data") or {}).get("primaryData") or {}
-
-            def num(x):
-                try:
-                    return float(str(x).replace("$", "").replace(",", ""))
-                except (TypeError, ValueError):
-                    return None
-            return num(pd.get("bidPrice")), num(pd.get("askPrice"))
-        except Exception:  # noqa: BLE001
-            return None, None
-
-    def earnings_calendar(self, days_ahead: int) -> dict[str, date]:
-        today = datetime.now(self.tz).date()
-        if self._earnings_day == today:
-            return self._earnings
-        out: dict[str, date] = {}
-        d, n = today, 0
-        while n <= days_ahead:
-            if self.clock.is_trading_day(d):
-                try:
-                    js = self.http.get_json(NASDAQ_EARNINGS.format(d=d.isoformat()), {"Accept": "application/json"})
-                    for row in ((js.get("data") or {}).get("rows") or []):
-                        sym = (row.get("symbol") or "").replace(".", "-").replace("/", "-")
-                        if sym and sym not in out:
-                            out[sym] = d
-                except Exception as e:  # noqa: BLE001
-                    self.errors.append(f"earnings {d}: {e}")
-                n += 1
-            d += timedelta(days=1)
-        self._earnings, self._earnings_day = out, today
-        return out
-
-    def halted_symbols(self) -> set[str]:
-        try:
-            xml = self.http.get_text(HALTS_RSS).lstrip("﻿")
-        except Exception as e:  # noqa: BLE001
-            self.errors.append(f"halts: {e}")
-            return set()
-        return parse_halts(xml, datetime.now(self.tz))
-
-    # --- samlet snapshot --------------------------------------------------------
-    def snapshots(self, universe: dict[str, dict], daily: dict[str, list[Bar]],
-                  with_spread_for: set[str] | None = None) -> dict[str, Snapshot]:
-        st = self.clock.status()
-        syms = [s for s in universe if s in daily]
-        intr = self.bulk_intraday(syms)
-        earnings = self.earnings_calendar(self.cfg.EARNINGS_BLACKOUT_DAYS + 1)
-        halts = self.halted_symbols()
-        today = st.now_market.date().isoformat()
-        out = {}
-        for s in syms:
-            i = intr.get(s)
-            if not i:
-                continue
-            if i.get("bar_date") and i["bar_date"] != today and st.session == "regular":
-                continue  # forældet intradag-data
-            meta = universe[s]
-            out[s] = Snapshot(
-                symbol=s, sector=meta["sector"], is_etf=meta["etf"], price=i["price"],
-                open=i["open"], prev_close=i["prev_close"], day_high=i["day_high"],
-                day_low=i["day_low"], volume_today=i["volume"], day_fraction=st.day_fraction,
-                bars=daily[s], earnings_date=earnings.get(s), halted=s in halts,
-                last_trade_age_s=i["last_trade_age_s"], asof=st.now_market.isoformat())
-        return out
-
-    def add_spreads(self, snaps: dict[str, Snapshot], symbols: list[str]):
-        for s in symbols:
-            sn = snaps.get(s)
-            if sn and sn.bid is None:
-                sn.bid, sn.ask = self.bid_ask(s, sn.is_etf)
-
-
-def parse_halts(xml: str, now_market: datetime) -> set[str]:
-    """Symboler der er stoppet nu (stop i dag uden passeret genoptagelsestid)."""
-    ns = {"ndaq": "http://www.nasdaqtrader.com/"}
+def http_get_json(url: str, headers: dict | None = None) -> dict:
+    """Eneste vej ud på nettet for data. Bevidst kun GET."""
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    assert req.get_method() == "GET"
     try:
-        root = ET.fromstring(xml)
-    except ET.ParseError:
-        return set()
-    out = set()
-    today = now_market.strftime("%m/%d/%Y")
-    for item in root.iter("item"):
-        def g(tag):
-            el = item.find(f"ndaq:{tag}", ns)
-            return (el.text or "").strip() if el is not None and el.text else ""
-        sym = g("IssueSymbol")
-        if not sym or g("HaltDate") != today:
-            continue
-        rdate, rtime = g("ResumptionDate"), g("ResumptionTradeTime")
-        if not rtime:
-            out.add(sym)
-            continue
-        try:
-            resume = datetime.strptime(f"{rdate or today} {rtime[:8]}", "%m/%d/%Y %H:%M:%S").replace(
-                tzinfo=now_market.tzinfo)
-            if resume > now_market:
-                out.add(sym)
-        except ValueError:
-            out.add(sym)
-    return {s.replace(".", "-") for s in out}
+        with urllib.request.urlopen(req, timeout=config.HTTP_TIMEOUT_S) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception as e:  # netværk, HTTP-fejl, JSON
+        raise DataError(f"GET {url.split('?')[0]} fejlede: {e}") from e
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+def model_spread(symbol: str, now: datetime) -> float:
+    """Realistisk spread når kilden ikke leverer bid/ask: typisk spread x sessionsfaktor."""
+    ins = market.instrument(symbol)
+    base = ins.typical_spread_pips * ins.pip
+    if market.in_rollover_blackout(now):
+        return base * 3.0
+    own = set(config.INSTRUMENT_SESSIONS.get(symbol, ()))
+    active = set(market.active_sessions(now))
+    return base if own & active else base * 1.6
+
+
+def resample(candles: list, minutes: int) -> list:
+    """Saml M15-lys til større tidsrammer (justeret til UTC-midnat)."""
+    out: list = []
+    cur = None
+    for c in candles:
+        epoch_min = int(c.time.timestamp() // 60)
+        bucket = datetime.fromtimestamp((epoch_min - epoch_min % minutes) * 60, UTC)
+        if cur is None or cur[0] != bucket:
+            if cur:
+                out.append(Candle(*cur))
+            cur = [bucket, c.open, c.high, c.low, c.close, c.volume]
+        else:
+            cur[2] = max(cur[2], c.high)
+            cur[3] = min(cur[3], c.low)
+            cur[4] = c.close
+            cur[5] += c.volume
+    if cur:
+        out.append(Candle(*cur))
+    return out
+
+
+def closed_only(candles: list, tf: str, now: datetime) -> list:
+    d = timedelta(minutes=TF_MINUTES[tf])
+    return [c for c in candles if c.time + d <= now]
+
+
+# ---------------------------------------------------------------- kilder
+class OandaProvider:
+    """OANDA v20 practice-API (gratis demokonto). Bruger kun /instruments/{x}/candles."""
+    name = "oanda"
+
+    def __init__(self, token: str = None, base_url: str = None):
+        self.token = token or config.OANDA_TOKEN
+        self.base = (base_url or config.OANDA_BASE_URL).rstrip("/")
+        if not self.token:
+            raise DataError("OANDA_TOKEN mangler (miljøvariabel)")
+
+    def candles(self, symbol: str, tf: str, count: int, now: datetime):
+        q = urllib.parse.urlencode({"granularity": tf, "count": count, "price": "MBA"})
+        url = f"{self.base}/v3/instruments/{symbol}/candles?{q}"
+        data = http_get_json(url, {"Authorization": f"Bearer {self.token}"})
+        out, quote = [], None
+        for c in data.get("candles", []):
+            t = datetime.strptime(c["time"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+            m = c["mid"]
+            if c.get("complete"):
+                out.append(Candle(t, float(m["o"]), float(m["h"]), float(m["l"]), float(m["c"]),
+                                  float(c.get("volume", 0))))
+            if "bid" in c and "ask" in c:
+                quote = Quote(symbol, now, float(c["bid"]["c"]), float(c["ask"]["c"]))
+        return out, quote
+
+
+class TwelveDataProvider:
+    """Twelve Data (gratis: 800 kald/dag). Henter kun M15 og bygger H1/H4 selv."""
+    name = "twelvedata"
+    native = ("M15",)
+
+    def __init__(self, key: str = None):
+        self.key = key or config.TWELVEDATA_KEY
+        if not self.key:
+            raise DataError("TWELVEDATA_KEY mangler (miljøvariabel)")
+
+    def candles(self, symbol: str, tf: str, count: int, now: datetime):
+        interval = {"M15": "15min", "H1": "1h", "H4": "4h"}[tf]
+        q = urllib.parse.urlencode({
+            "symbol": config.TWELVEDATA_SYMBOLS[symbol], "interval": interval,
+            "outputsize": min(count, 5000), "timezone": "UTC", "apikey": self.key})
+        data = http_get_json(f"{config.TWELVEDATA_BASE_URL}/time_series?{q}")
+        if data.get("status") == "error":
+            raise DataError(f"Twelve Data: {data.get('message')}")
+        out = []
+        for v in reversed(data.get("values", [])):
+            t = datetime.strptime(v["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            out.append(Candle(t, float(v["open"]), float(v["high"]), float(v["low"]),
+                              float(v["close"]), float(v.get("volume") or 0)))
+        out = closed_only(out, tf, now)
+        if not out:
+            return out, None
+        sp = model_spread(symbol, now)
+        last = out[-1].close
+        return out, Quote(symbol, now, last - sp / 2, last + sp / 2)
+
+
+# ---------------------------------------------------------------- markedsdata-lag
+class LiveMarketData:
+    """Cacher lys pr. tidsramme og henter kun igen efter config.REFRESH_S."""
+
+    def __init__(self, provider):
+        self.provider = provider
+        self._candles: dict = {}
+        self._fetched: dict = {}
+        self._quotes: dict = {}
+        self.now = datetime.now(UTC)
+        self.errors: list = []
+
+    def refresh(self, now: datetime, symbols: list) -> None:
+        self.now = now
+        self.errors = []
+        tfs = ("M15", "H1", "H4")
+        for s in symbols:
+            for tf in tfs:
+                key = (s, tf)
+                if _time.time() - self._fetched.get(key, 0) < config.REFRESH_S[tf] and tf != "M15":
+                    continue
+                if tf != "M15" and getattr(self.provider, "native", None) == ("M15",):
+                    continue
+                try:
+                    cs, q = self.provider.candles(s, tf, config.CANDLE_COUNT[tf], now)
+                    self._candles[key] = cs
+                    self._fetched[key] = _time.time()
+                    if tf == "M15" and q:
+                        self._quotes[s] = q
+                except DataError as e:
+                    self.errors.append(str(e))
+            if getattr(self.provider, "native", None) == ("M15",) and (s, "M15") in self._candles:
+                m15 = self._candles[(s, "M15")]
+                self._candles[(s, "H1")] = closed_only(resample(m15, 60), "H1", now)
+                self._candles[(s, "H4")] = closed_only(resample(m15, 240), "H4", now)
+
+    def candles(self, symbol: str, tf: str) -> list:
+        return self._candles.get((symbol, tf), [])
+
+    def quote(self, symbol: str) -> Quote | None:
+        return self._quotes.get(symbol)
+
+
+class ReplayMarketData:
+    """Afspiller historiske/syntetiske M15-lys tidstro – bruges af backtest og tests."""
+
+    def __init__(self, m15: dict, spreads: dict | None = None):
+        self.m15 = m15
+        self.h1 = {s: resample(c, 60) for s, c in m15.items()}
+        self.h4 = {s: resample(c, 240) for s, c in m15.items()}
+        self._times = {(s, tf): [c.time for c in series]
+                       for tf, d in (("M15", self.m15), ("H1", self.h1), ("H4", self.h4))
+                       for s, series in d.items()}
+        self.spreads = spreads or {}
+        self.now = None
+        self.errors: list = []
+
+    def refresh(self, now: datetime, symbols: list = None) -> None:
+        self.now = now
+
+    def candles(self, symbol: str, tf: str) -> list:
+        series = {"M15": self.m15, "H1": self.h1, "H4": self.h4}[tf].get(symbol, [])
+        cutoff = self.now - timedelta(minutes=TF_MINUTES[tf])
+        i = bisect.bisect_right(self._times[(symbol, tf)], cutoff)
+        lo = max(0, i - config.CANDLE_COUNT[tf])
+        return series[lo:i]
+
+    def quote(self, symbol: str) -> Quote | None:
+        cs = self.candles(symbol, "M15")
+        if not cs:
+            return None
+        sp = self.spreads.get((symbol, cs[-1].time)) or model_spread(symbol, self.now)
+        return Quote(symbol, self.now, cs[-1].close - sp / 2, cs[-1].close + sp / 2)
+
+
+def make_provider(name: str = None):
+    name = name or config.DATA_PROVIDER
+    if name == "oanda":
+        return OandaProvider()
+    if name == "twelvedata":
+        return TwelveDataProvider()
+    if name == "synthetic":
+        from .synthetic import SyntheticProvider
+        return SyntheticProvider()
+    raise DataError(f"Ukendt datakilde: {name}")

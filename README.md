@@ -1,212 +1,137 @@
-# Papirdesk
+# Desk – papirhandels-bot til forex og råvarer
 
-En papirhandels-bot ("desk") til amerikanske aktier (S&P 500-konstituenter) og de største ETF'er.
+**Kun papirhandel med fiktive penge.** Der findes ingen kode, der sender ordrer til en mægler.
+Datalaget kan kun lave `GET`-kald, og en test holder øje med det. Brug en *practice*-/demonøgle
+eller en nøgle, der kun kan læse data.
 
-> **Kun papirhandel med fiktive penge.** Der findes ingen kode, der kan sende ordrer til en
-> rigtig mægler. Executor ændrer kun tal i `state.json`.
+- Instrumenter: EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD, NZD/USD, EUR/GBP, EUR/JPY,
+  GBP/JPY, guld (XAU), sølv (XAG), WTI- og Brent-olie.
+- Ren Python 3.11+ og kun standardbiblioteket (ingen `pip install`).
+- 18 strategier kører side om side, hver på sin egen virtuelle konto.
+- Dansk, mobilvenligt dashboard på port 8787. Alle tal vises i procent.
 
-- Ren **Python 3.11+ standardbibliotek**, ingen afhængigheder.
-- Gratis data: Yahoo Finance (kurser), Nasdaq.com (bid/ask, earnings-kalender), NasdaqTrader (handelsstop).
-- Seks agenter med hårde overdragelser, 17 regelsæt på hver sin virtuelle konto, skyggehandler,
-  dansk mobilvenligt dashboard, ntfy-notifikationer, systemd-drift og en historisk backtest.
-
-## Kom i gang
+## Hurtig start
 
 ```bash
-git clone <repo> /opt/papirdesk && cd /opt/papirdesk
-python3 -m unittest discover -s tests -t .
-python3 backtest.py              # valgfrit: historisk backtest (~10 min første gang)
-python3 bot.py                   # bot + dashboard på http://localhost:8787
+cd desk
+python3 -m unittest discover -s tests -t .      # 58 tests
+python3 -m desk backtest --days 90              # skriver docs/backtest.md
+export OANDA_TOKEN=...                          # practice-token fra OANDA
+python3 -m desk check                           # test datakilden
+python3 -m desk run                             # bot + dashboard (http://<host>:8787)
 ```
 
-`python3 bot.py --once` kører én cyklus med det samme (henter data, scorer og handler kun hvis
-markedet er åbent) og stopper. `python3 dashboard.py` starter kun dashboardet.
+Uden nøgle kan du prøve det hele med `DESK_PROVIDER=synthetic python3 -m desk run` (syntetiske data).
 
-## Arkitektur
+## Arkitektur: seks agenter med hårde overdragelser
 
 ```
-Snapshot ─► Scout ─► Candidate ─► Filter ─► Passed ─► Analyst ─► Scored ─► Risk ─► Order ─► Executor ─► Fill
-                                                                                                │
-                              Logger (SQLite: cyklusser, hændelser, overdragelser, handler,    ◄┘
-                                      egenkapital, skyggehandler)
+Scout ──ScoutReport──▶ Filter ──FilterReport──▶ Analyst ──AnalystReport──▶ strategi ──TradeIntent──▶
+Risk ──RiskDecision──▶ Executor ──ExecutionResult        Logger skriver hvert led til SQLite
 ```
 
-Overdragelserne er frosne dataklasser (`desk/models.py`); hver agent kan kun læse den forrige
-agents output. Alle overdragelser logges i tabellen `handoffs`.
+Overdragelserne er frosne dataklasser (`desk/models.py`). Hver agent får **kun** det, den forrige agent afleverede.
 
 | Agent | Fil | Opgave |
 |---|---|---|
-| **Scout** | `desk/agents/scout.py` | Finder kandidater: stor relativ volumen (justeret for tid på dagen), gap op/ned, nye 52-ugers toppe. Desuden `pullback` og `oversold` til dip-køb/mean reversion. |
-| **Filter** | `desk/agents/filter.py` | Dræber: lav gennemsnitsvolumen/omsætning, kurs < 5 USD, bred spread (bid/ask fra Nasdaq), earnings inden for X dage, handelsstop (NasdaqTrader RSS + ingen handler i 15 min), for kort historik. |
-| **Analyst** | `desk/agents/analyst.py` | Score 0-100 af seks komponenter: momentum, relativ styrke mod sektor-ETF og SPY, volumen, trend (SMA20/50/200), volatilitet (ATR mod ideelt bånd), markedets retning via SPY. |
-| **Risk** | `desk/agents/risk.py` | Initialt stop = entry − k×ATR, trailing stop = top − k×ATR, maks. stopafstand, maks. eksponering pr. sektor. Overvåger åbne positioner (stop, trailing, gevinstmål, holdetid, regelsættets exit). |
-| **Executor** | `desk/agents/executor.py` | Fast procent af kontoen pr. handel, slippage (+ halv spread), kommission, maks. antal positioner, karantæne efter salg, ingen handler det første minut efter åbning. |
-| **Logger** | `desk/agents/logger.py` | Eneste agent der skriver til `data/desk.sqlite`. |
+| Scout | `agents/scout.py` | Vælger instrumenter i deres egne sessioner (Asien/London/New York) med nok udsving (ATR-ratio). Uden for egen session kræves mere udsving. |
+| Filter | `agents/filter.py` | Dræber kandidater ved for stor spread (i forhold til ATR og til normal spread), vigtige nyheder inden for ±30 min, meget lav volatilitet, forældede data og rollover-vinduet kl. 17 New York-tid. |
+| Analyst | `agents/analyst.py` | Giver en score fra 0 til 100 for både long og short ud fra trend (M15/H1/H4), momentum, ATR-udsving, renteforskel (carry) og korrelation med beslægtede par. Beregner også breakout- og mean reversion-komponenter. |
+| Risk | `agents/risk.py` | Sætter stop og trailing stop i ATR-multipla. Har loft over samlet risiko pr. valuta (fem EUR-handler tæller som én stor EUR-handel), loft over korrelerede positioner, dagligt tabsloft og stop ved drawdown. Åbner ingen nye handler lige før weekenden. |
+| Executor | `agents/executor.py` | Fast risiko i % af kontoen pr. handel. Fylder på bid/ask (spread), lægger glid på stop og trækker swap ved rollover (onsdag ×3). Har maks. antal positioner, gearingsloft, karantæne efter lukning og lukker alt før weekenden. |
+| Logger | `agents/logger.py` | Den eneste, der skriver til SQLite: tik, scout, filter, signaler, beslutninger, handler, egenkapital, skyggehandler og hændelser. |
 
-`desk/pipeline.py` (`Desk.run_cycle`) samler kæden og bruges af både botten og backtesten.
+Alle tærskler ligger i **`desk/config.py`** og vises også under fanen *Regler*.
 
-## Markedstid
+### Markedets ur (`desk/market.py`)
+- Åbent fra søndag 17:00 til fredag 17:00 New York-tid. Sommertid håndteres via `zoneinfo`.
+  Helligdagene 25/12 og 1/1 er lukkede.
+- Sessionerne følger lokal tid: Sydney/Tokyo (= Asien), London og New York. Overlappet kan ses i dashboardet.
+- Handelsdagen og dagligt tabsloft skifter kl. 17:00 New York-tid. Råvarer holder pause fra 17 til 18.
 
-`desk/market_clock.py` regner i `America/New_York` (zoneinfo håndterer sommertid, som skifter på
-andre datoer end i Danmark). NYSE-helligdage beregnes for ethvert år (inkl. langfredag via
-påskeberegning og "observed"-reglerne), halve dage kl. 13:00 (3. juli, dagen efter Thanksgiving,
-juleaften) og ekstraordinære lukninger i `config.EXTRA_HOLIDAYS`.
-
-| Fase (NY-tid) | Bottens adfærd |
-|---|---|
-| ~08:45 | Forberedelse: univers (Wikipedia, cachet 7 dage), dagsbarer, earnings-kalender |
-| 04:00-09:30 førmarked | Handler ikke, sover til åbning + 1 min |
-| 09:30-16:00 åbent | Cyklus hvert 10. minut (`SCAN_INTERVAL_MINUTES`) |
-| 16:00-20:00 eftermarked | Dagsafslutning én gang: daglig egenkapital, skyggehandler, ntfy-resumé |
-| Ellers / weekend / helligdag | Sover til næste forberedelse (i bidder af højst 15 min) |
-
-## Regelsæt (strategitest)
-
-17 regelsæt kører side om side, hver på sin egen virtuelle konto (`desk/strategies.py`):
-
-Basis · Momentum · Breakout · Mean reversion · Gap op · Gap ned-rebound · Dip-køb i optrend ·
-Kræsen · Aggressiv · Mange små · Trendfølger · RS-ledere · Volumenstød · Lav volatilitet ·
-ETF-rotation · Markedsfilter · Hurtig swing.
-
-Hvert regelsæt kan sætte: hvilke Scout-signaler det reagerer på, en indgangsregel, egne score-vægte,
-minimumsscore, positionsstørrelse, maks. positioner, ATR-stop/trailing, gevinstmål, maks. holdetid,
-sektorloft, univers (aktier/ETF) og SPY-filter. Alt der ikke er sat, arves fra `config.py`.
-Den fulde regeltabel vises i dashboardets **Regler**-fane.
-
-**Skyggehandler:** alle aktier som Analysten scorer, registreres som fiktive køb i tabellen `shadow`.
-Ved dagsafslutning udfyldes afkastet efter 1, 5 og 10 handelsdage, så man kan se om højere score
-faktisk giver højere afkast (vises i **Handler**-fanen).
-
-**Nulstilling:** hæv `EPOCH` i `config.py` og genstart. Den gamle papirbog gemmes som
-`state.epoch-<n>.json`, alle konti starter forfra, og dashboardet viser kun den nye epoch.
-
-## Papirbogen – `state.json`
-
-Portabel JSON med én konto pr. regelsæt (kontanter, positioner med stop/trailing, karantæne,
-daglig afkasthistorik, antal handler/gevinster, drawdown). Skrives atomisk. Kopiér filen til en
-anden maskine for at flytte desken. Den interne regneenhed (`START_EQUITY`) vises aldrig –
-**dashboardet viser altid papirpenge i procent**.
-
-## Dashboard
-
-`http://<maskine>:8787` – dansk, mobilvenligt, lyst/mørkt tema efter systemet.
-
-- **Oversigt:** markedsstatus (åbent/lukket/før-/eftermarked, næste åbning i dansk og NY-tid),
-  nøgletal, "Afkast over tid" med blød kurve (gennemsnit, valgt regelsæt og SPY), hændelseslog.
-- **Strategier:** kort pr. regelsæt med afkast, minikurve, hitrate, maks. fald, investeringsgrad,
-  plus resultaterne af den historiske backtest.
-- **Handler:** åbne positioner, afsluttede handler (resultat i %), skyggehandel-statistik.
-- **Regler:** alle tærskler fra `config.py` og regeltabellen for alle regelsæt.
-
-Dashboardet er kun-læsning og har ingen login. Udsæt det ikke direkte på internettet – brug fx
-VPN/Tailscale eller sæt `DASHBOARD_HOST = "127.0.0.1"`.
-
-## Notifikationer (ntfy)
-
-Sæt `NTFY_TOPIC` i `config.py` til et svært gætteligt emne og abonnér i ntfy-appen.
-Der sendes besked ved handler, et dagligt resumé (top 5 og gennemsnit i %) og fejl.
-Egen ntfy-server: `NTFY_SERVER`.
-
-## Drift som systemd-service (24/7)
-
-```bash
-sudo useradd --system --home /opt/papirdesk papirdesk
-sudo chown -R papirdesk: /opt/papirdesk
-sudo cp deploy/papirdesk.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now papirdesk
-journalctl -u papirdesk -f
-```
-
-Servicen har `Restart=always`. Botten fanger selv fejl i løkken (logger, ntfy'er og prøver igen
-med stigende pause), og systemd genstarter den, hvis processen alligevel dør. Efter genstart
-fortsætter den fra `state.json`.
-
-## Historisk backtest
-
-```bash
-python3 backtest.py                     # 5 års dagsdata, alle regelsæt
-python3 backtest.py --max-symbols 100   # hurtigere
-python3 backtest.py --start 2024-01-01  # delperiode
-```
-
-Resultatet gemmes i `backtest_results.json` (vises i dashboardet) og `BACKTEST.md`.
-Backtesten bruger de samme agenter som live-botten, men med dagsbarer: beslutning ved luk,
-udførelse ved næste dags åbning, stop tjekkes mod dagens lav (gap under stop fyldes til åbningskursen).
-
-### Seneste resultat (2022-11-21 – 2026-11-18, 543 symboler, 1002 handelsdage)
-
-| | Afkast | CAGR | Maks. fald | Sharpe |
-|---|---:|---:|---:|---:|
-| SPY køb og hold | +94,9 % | +18,2 % | 18,8 % | 1,18 |
-| Gns. alle 17 regelsæt | +51,1 % | – | 10,5 % | – |
-| Markedsfilter (bedst) | +109,2 % | +20,3 % | 11,2 % | 1,51 |
-| Kræsen | +90,1 % | +17,5 % | 8,5 % | 1,53 |
-| RS-ledere | +72,6 % | +14,7 % | 17,5 % | 0,99 |
-| Lav volatilitet (svagest) | +7,4 % | +1,8 % | 12,2 % | 0,22 |
-
-Kun to regelsæt slog SPY på afkast, men flere havde mindre fald og bedre Sharpe. Begge vindere
-handler kun når markedet (SPY) er i optrend. **Vigtigt:** skyggehandlerne viser, at Analystens
-basis-score *ikke* forudsiger afkast – aktier med score under 20 gav højere 5- og 10-dages afkast
-end aktier med score over 80 (kortsigtet mean reversion). Score-vægtene i `config.py` bør derfor
-justeres, før scoren tillægges vægt. Fuld tabel: `BACKTEST.md`.
-
-![Oversigt](docs/dash-desktop-oversigt.png)
-
-Forbehold: universet er *nuværende* S&P 500-konstituenter (survivorship bias); historiske
-earnings-datoer, spreads og handelsstop kendes ikke, så de filtre er passive i backtesten;
-relativ volumen er hele dagens volumen. Se `BACKTEST.md` for de seneste tal.
-
-## Konfiguration
-
-Alle tærskler bor i `config.py`, grupperet efter agent. De vigtigste:
-
-| Nøgle | Standard | Betydning |
+### Data
+| Kilde | Pris | Bemærkning |
 |---|---|---|
-| `SCOUT_MIN_RVOL` | 1,8 | Min. relativ volumen |
-| `SCOUT_GAP_PCT` | 2 % | Gap op/ned |
-| `MIN_AVG_VOLUME` | 1 mio. | Min. 20-dages gennemsnitsvolumen |
-| `MAX_SPREAD_PCT` | 0,15 % | Maks. spread |
-| `EARNINGS_BLACKOUT_DAYS` | 3 | Ingen køb så tæt på earnings |
-| `ATR_STOP_MULT` / `ATR_TRAIL_MULT` | 2 / 3 | Stop og trailing i ATR |
-| `MAX_SECTOR_PCT` | 30 % | Maks. eksponering pr. sektor |
-| `POSITION_PCT` | 8 % | Andel af kontoen pr. handel |
-| `MAX_OPEN_POSITIONS` | 10 | Maks. åbne positioner |
-| `SLIPPAGE_BPS` | 5 | Slippage + halv spread |
-| `QUARANTINE_DAYS` | 3 | Karantæne efter salg |
-| `NO_TRADE_FIRST_MINUTES` | 1 | Ingen handler lige efter åbning |
-| `EPOCH` | 1 | Hæv for at nulstille |
+| **OANDA practice** (`oanda`, anbefalet) | gratis demokonto | Bruger kun `GET /v3/instruments/{x}/candles` med `price=MBA`, som giver rigtig bid/ask og dermed rigtig spread. |
+| Twelve Data (`twelvedata`) | gratis 800 kald/dag | Henter kun M15 og bygger selv H1/H4. Spread modelleres. 14 instrumenter hvert 5. min er for mange kald til gratisplanen, så hæv `REFRESH_S["M15"]` eller skær ned på `INSTRUMENTS`. |
+| Alpha Vantage | 25 kald/dag gratis | Ikke implementeret, fordi kvoten er for lille til intradag-data. |
+| `synthetic` | – | Til demo, tests og backtest. |
+
+Nyheder kommer fra en gratis ugekalender i JSON (`DESK_NEWS_URL`, ForexFactory-format) og fra faste regler:
+jobtal (NFP) første fredag, US CPI og rentemøder for Fed, ECB og BoE fra `CENTRAL_BANK_MEETINGS`.
+Med de faste regler virker nyhedsfilteret også uden net.
+
+**Opdatér `POLICY_RATES` og `CENTRAL_BANK_MEETINGS` i config.py**, når centralbankerne ændrer dem.
+De bruges til carry-score og swap.
+
+## Strategier (18)
+
+`standard`, `trend`, `trend-langsom`, `breakout-london`, `breakout-newyork`, `meanrev-asien`, `nyhedsfilter`,
+`kraesen`, `aggressiv`, `mange-smaa`, `momentum`, `carry`, `korrelation`, `kun-raavarer`, `kun-majors`,
+`swing`, `scalp-overlap` og `tilfaeldig` (kontrol, der vælger ved møntkast og har samme risikostyring).
+Hver strategi har sine egne komponentvægte, minimumsscore, risiko, stop, mål, maks. antal positioner og karantæne
+(se `desk/strategies.py`). En strategi, der ikke slår `tilfaeldig`, har ingen fordel.
+
+**Skyggehandler:** alle scorede signaler med score ≥ 55 følges som fiktive handler med 2 ATR stop og 2R mål,
+uanset om en strategi handlede. Fanen *Handler* viser hitrate og gennemsnitlig R pr. scoreinterval,
+så man kan se, om scoren virker.
+
+**Epoke:** nulstiller alle konti uden at slette historikken.
+
+```bash
+python3 -m desk epoch --reason "nye renter i config"   # den kørende bot udfører den inden for 1 min
+python3 -m desk epoch --offline                        # når botten ikke kører
+```
+
+## Dashboard (port 8787)
+
+Fanerne er *Oversigt*, *Strategier*, *Handler* og *Regler*. Øverst ses, om markedet er åbent eller lukket,
+den aktive session, hvornår markedet næste gang åbner eller lukker, og hvornår botten sidst gav lyd fra sig.
+*Afkast over tid* er en blød kurve pr. strategi. Du kan fremhæve op til 4 strategier, og grafen kan også vises
+som tabel. Dashboardet kan kun læse og har ingen knapper, der ændrer noget.
+Det lytter på `0.0.0.0` som standard. Hvis serveren står på internettet, så sæt det bag en firewall eller VPN
+(fx Tailscale), eller brug `DESK_DASHBOARD_HOST=127.0.0.1`.
+
+## Drift (systemd, 24/7)
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin desk
+sudo cp -r desk /opt/desk
+sudo cp /opt/desk/deploy/desk.env.example /etc/desk.env
+sudo chmod 600 /etc/desk.env
+sudo nano /etc/desk.env                # OANDA_TOKEN, NTFY_TOPIC
+sudo cp /opt/desk/deploy/desk.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now desk
+journalctl -u desk -f
+```
+
+- Tjenesten kører med `Restart=always`. Hovedløkken fanger selv fejl og sender en ntfy-alarm efter 3 fejl i træk.
+- `state.json` (konti, positioner, karantæne, skyggehandler og epoke) skrives atomisk efter hvert tik.
+  Er filen beskadiget, gemmes den som `.corrupt`, og botten starter rent.
+- SQLite i WAL-tilstand ligger i `/var/lib/desk/desk.sqlite3`. Dashboardet åbner den skrivebeskyttet.
+- ntfy sender besked ved start, åbne/lukke-handler (`NTFY_ON_TRADES`), tabsloft, datafejl og en dagsstatus kl. 17 NY.
+- Mens markedet er lukket, sover botten 5 minutter ad gangen og laver ingen API-kald.
+
+## Backtest
+
+`python3 -m desk backtest --days 90 [--seed 7] [--source synthetic|csv:<mappe>]` kører **præcis samme pipeline**
+som live. Kun uret og datalaget er udskiftet (`ReplayMarketData`, der aldrig ser ind i fremtiden).
+Til CSV skal der ligge én fil pr. instrument, fx `EUR_USD.csv`, med kolonnerne `time,open,high,low,close` (UTC, M15).
+
+Resultatet står i [`docs/backtest.md`](docs/backtest.md). **Vigtigt:** standardkørslen bruger *syntetiske* data.
+De tester, at mekanikken virker (stops, spread, swap, lofter og sessioner), men siger intet om rigtig rentabilitet.
+Kør backtesten på rigtige OANDA-data, og lad botten papirhandle i flere måneder, før du tror på en strategi.
 
 ## Filer
 
 ```
-config.py                  alle tærskler
-bot.py / dashboard.py / backtest.py   indgange
-desk/market_clock.py       børstid, helligdage, sessioner
-desk/data.py               Yahoo / Nasdaq / NasdaqTrader (stdlib urllib)
-desk/universe.py           S&P 500 (Wikipedia) + top-ETF'er
-desk/indicators.py         SMA, ATR, RSI, features
-desk/agents/*.py           de seks agenter
-desk/strategies.py         regelsættene
-desk/pipeline.py           én cyklus (live og backtest)
-desk/ledger.py             papirbogen state.json
-desk/backtest.py           historisk backtest
-desk/dashboard.py, static/ dashboard
-desk/notify.py             ntfy
-deploy/papirdesk.service   systemd
-tests/                     unittest (ingen netværk)
+desk/config.py        alle tærskler          desk/engine.py     orkestrering, state.json, live-løkke
+desk/models.py        overdragelseskontrakter desk/strategies.py 18 regelsæt
+desk/market.py        weekend/sessioner       desk/accounts.py   P&L, omregning, swap, eksponering
+desk/data.py          OANDA/TwelveData/replay desk/news.py       økonomisk kalender
+desk/agents/*.py      de seks agenter         desk/shadow.py     skyggehandler
+desk/dashboard.py     HTTP + API              desk/web/index.html dashboard (vanilla JS/SVG)
+desk/backtest.py      backtest + rapport      desk/synthetic.py  syntetisk marked
+deploy/               systemd-unit og env-eksempel
 ```
-
-## Tests
-
-```bash
-python3 -m unittest discover -s tests -t .
-```
-
-Dækker kalender (helligdage, halve dage, sommertid, næste åbning), indikatorer, hver agent,
-papirbog/epoch, en hel cyklus, backtest på syntetiske data, parsere og dashboardets API.
-
-## Ansvarsfraskrivelse
-
-Undervisnings- og eksperimentværktøj. Ikke investeringsrådgivning. Data fra gratis kilder kan være
-forsinkede, ufuldstændige eller ændre format uden varsel. Kun papirhandel.

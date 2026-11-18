@@ -1,195 +1,291 @@
 import unittest
-from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
+from dataclasses import replace
+from datetime import timedelta
 
-from desk.agents.analyst import Analyst, market_context
+from desk import accounts, config
+from desk.agents.analyst import Analyst
 from desk.agents.executor import Executor
 from desk.agents.filter import Filter
-from desk.agents.logger import Logger
 from desk.agents.risk import Risk
 from desk.agents.scout import Scout
-from desk.indicators import compute_features
-from desk.ledger import new_account
-from desk.models import Candidate, Order, Passed
+from desk.models import (AnalystReport, FilterReport, Position, Quote, RiskDecision, ScoutReport,
+                         Signal, TradeIntent)
+from desk.news import NewsCalendar, NewsEvent
 from desk.strategies import BY_NAME, STRATEGIES, Strategy
-from tests.helpers import cfg, snap, trend_bars
+from tests.helpers import FakeMD, utc
 
-NY = ZoneInfo("America/New_York")
-TODAY = date(2025, 1, 2)
-
-
-def cand(s, c):
-    f = compute_features(s, c)
-    return Candidate(s.symbol, tuple(Scout(c).signals_for(f)), 1.0, f, s)
+NOW = utc(2026, 11, 18, 14, 0)  # onsdag, London + New York
 
 
-class TestScout(unittest.TestCase):
-    def test_signals(self):
-        c = cfg()
-        bars = trend_bars()
-        last = bars[-1].close
-        sc = Scout(c)
-        out = sc.run({
-            "GAPU": snap("GAPU", bars, price=last * 1.05, open_=last * 1.04),
-            "GAPD": snap("GAPD", bars, price=last * 0.97, open_=last * 0.96),
-            "VOL": snap("VOL", bars, price=last * 0.999, volume=bars[-1].volume * 3),
-            "QUIET": snap("QUIET", trend_bars(step=-0.001), price=trend_bars(step=-0.001)[-1].close),
-        })
-        sig = {c.symbol: set(c.signals) for c in out}
-        self.assertIn("gap_up", sig["GAPU"])
-        self.assertIn("new_high52", sig["GAPU"])
-        self.assertIn("gap_down", sig["GAPD"])
-        self.assertIn("rvol", sig["VOL"])
-        self.assertNotIn("QUIET", sig)
+def market_md(now=NOW, trend=0.0002):
+    md = FakeMD(now)
+    prices = {"EUR_USD": 1.08, "GBP_USD": 1.27, "USD_JPY": 150.0, "USD_CHF": 0.88, "AUD_USD": 0.66,
+              "USD_CAD": 1.37, "NZD_USD": 0.60, "EUR_GBP": 0.85, "EUR_JPY": 162.0, "GBP_JPY": 190.0,
+              "XAU_USD": 2600.0, "XAG_USD": 31.0, "WTICO_USD": 70.0, "BCO_USD": 74.0}
+    for s, p in prices.items():
+        md.set(s, price=p, step=p * trend / 10, rng=p * 0.001, spread=p * 0.00002)
+    return md
 
 
-class TestFilter(unittest.TestCase):
+def pipeline(md, news=None, now=NOW):
+    news = news or NewsCalendar(fetch=False)
+    sr = Scout().run(now, md)
+    fr = Filter(news).run(sr, md)
+    ar = Analyst().run(fr, md)
+    return sr, fr, ar
+
+
+class HandoffTest(unittest.TestCase):
+    def test_handoff_types(self):
+        sr, fr, ar = pipeline(market_md())
+        self.assertIsInstance(sr, ScoutReport)
+        self.assertIsInstance(fr, FilterReport)
+        self.assertIsInstance(ar, AnalystReport)
+        self.assertTrue(sr.picks)
+        # Filter ser kun Scouts udvalg, Analyst kun Filters gennemsluppne
+        self.assertTrue({f.pick.instrument for f in fr.passed} <= {p.instrument for p in sr.picks})
+        self.assertEqual({s.instrument for s in ar.signals}, {f.pick.instrument for f in fr.passed})
+
+    def test_scout_returns_nothing_on_weekend(self):
+        sat = utc(2026, 11, 21, 12)
+        sr = Scout().run(sat, market_md(sat))
+        self.assertEqual(sr.picks, ())
+
+
+class FilterTest(unittest.TestCase):
+    def test_kills_wide_spread(self):
+        md = market_md()
+        q = md.q["EUR_USD"]
+        md.q["EUR_USD"] = Quote("EUR_USD", NOW, q.bid - 0.001, q.ask + 0.001)
+        _, fr, _ = pipeline(md)
+        reasons = dict(fr.killed)
+        self.assertIn("spread", reasons.get("EUR_USD", ""))
+
+    def test_kills_news(self):
+        news = NewsCalendar(fetch=False, extra=[NewsEvent(NOW + timedelta(minutes=10), "USD", "Rentebeslutning")])
+        _, fr, _ = pipeline(market_md(), news)
+        reasons = dict(fr.killed)
+        self.assertIn("nyhed", reasons.get("EUR_USD", ""))
+        self.assertIn("EUR_GBP", {f.pick.instrument for f in fr.passed} | set(reasons))
+        self.assertNotIn("nyhed", reasons.get("EUR_GBP", ""))
+
+    def test_kills_low_volatility(self):
+        md = market_md()
+        sr = Scout().run(NOW, md)
+        low = replace(sr.picks[0], atr_ratio=0.3)
+        sr = replace(sr, picks=(low,))
+        fr = Filter(NewsCalendar(fetch=False)).run(sr, md)
+        self.assertIn("volatilitet", fr.killed[0][1])
+
+
+class AnalystTest(unittest.TestCase):
+    def test_uptrend_scores_long(self):
+        _, _, ar = pipeline(market_md(trend=0.0003))
+        s = next(x for x in ar.signals if x.instrument == "EUR_USD")
+        self.assertGreater(s.long_score, s.short_score)
+        self.assertGreater(s.components["trend"][0], 60)
+        for k in ("trend", "momentum", "volatility", "carry", "correlation"):
+            l, sh = s.components[k]
+            self.assertTrue(0 <= l <= 100 and 0 <= sh <= 100)
+
+    def test_carry_sign(self):
+        _, _, ar = pipeline(market_md())
+        uj = next((x for x in ar.signals if x.instrument == "USD_JPY"), None)
+        if uj:  # USD-rente > JPY-rente -> carry favoriserer long USD_JPY
+            self.assertGreater(uj.components["carry"][0], 50)
+
+
+def make_signal(sym="EUR_USD", price=1.08, atr=0.002):
+    from desk.models import FilterPass, ScoutPick
+    fp = FilterPass(ScoutPick(sym, 1.0, ("london",), "test"), 0.0001, 0.05, None, "")
+    comps = {k: (80.0, 20.0) for k in ("trend", "momentum", "volatility", "carry", "correlation",
+                                      "breakout", "meanrev")}
+    return Signal(sym, NOW, price, atr, atr / 3, 80.0, 20.0, comps,
+                  {"sessions": ("london", "newyork"), "minutes_in": {"london": 300, "newyork": 60},
+                   "trend_tf": {"H4": 0.6}, "peers": [("GBP_USD", 0.7)]}, fp)
+
+
+def quotes():
+    vals = {"EUR_USD": 1.08, "GBP_USD": 1.27, "USD_JPY": 150.0, "EUR_GBP": 0.85, "AUD_USD": 0.66,
+            "USD_CHF": 0.88, "USD_CAD": 1.37, "NZD_USD": 0.6, "EUR_JPY": 162.0, "XAU_USD": 2600.0}
+    return {k: Quote(k, NOW, v * (1 - 1e-5), v * (1 + 1e-5)) for k, v in vals.items()}
+
+
+class RiskTest(unittest.TestCase):
     def setUp(self):
-        self.c = cfg()
-        self.f = Filter(self.c)
+        self.p = BY_NAME["standard"]
+        self.acc = accounts.new_account("standard")
 
-    def reason(self, s):
-        return self.f.check(cand(s, self.c), TODAY)
+    def intent(self, sym="EUR_USD", d="long", price=1.08):
+        return TradeIntent("standard", make_signal(sym, price), d, 80.0, "test")
 
-    def test_pass(self):
-        self.assertIsNone(self.reason(snap()))
+    def test_stop_in_atr_multiples(self):
+        dec = Risk().run(self.intent(), self.acc, self.p, quotes(), {}, NOW)
+        self.assertTrue(dec.approved)
+        self.assertAlmostEqual(dec.stop_distance, self.p.stop_atr * 0.002)
+        self.assertAlmostEqual(dec.trail_distance, self.p.trail_atr * 0.002)
 
-    def test_kills(self):
-        self.assertIn("handelsstop", self.reason(snap(halted=True)))
-        self.assertIn("muligt stop", self.reason(snap(last_trade_age_s=3600)))
-        self.assertIn("gennemsnitsvolumen", self.reason(snap(bars=trend_bars(vol=10_000))))
-        self.assertIn("spread", self.reason(snap(bid=100.0, ask=101.0)))
-        self.assertIn("earnings", self.reason(snap(earnings_date=TODAY + timedelta(days=2))))
-        self.assertIsNone(self.reason(snap(earnings_date=TODAY + timedelta(days=10))))
-        self.assertIsNone(self.reason(snap(is_etf=True, earnings_date=TODAY)))   # ETF'er har ikke earnings
-        self.assertIn("historik", self.reason(snap(bars=trend_bars(n=100))))
-        self.assertIn("kurs under", self.reason(snap(bars=trend_bars(start=2.0, vol=5e7))))
+    def test_currency_exposure_caps_stacked_eur(self):
+        """Fem EUR-handler er én stor EUR-handel: den 3. long-EUR afvises ved 2,5 % loft."""
+        q, ex = quotes(), Executor()
+        p = replace(self.p, max_ccy_risk=2.5)
+        for sym in ("EUR_USD", "EUR_GBP"):
+            dec = Risk().run(self.intent(sym, price=q[sym].mid), self.acc, p, q, {}, NOW)
+            self.assertTrue(dec.approved, dec.reason)
+            self.assertTrue(ex.run(dec, self.acc, p, q, NOW).filled)
+        dec = Risk().run(self.intent("EUR_JPY", price=q["EUR_JPY"].mid), self.acc, p, q, {}, NOW)
+        self.assertFalse(dec.approved)
+        self.assertIn("EUR-eksponering", dec.reason)
+        # modsat retning reducerer EUR-eksponeringen og er tilladt
+        dec = Risk().run(self.intent("EUR_JPY", d="short", price=q["EUR_JPY"].mid), self.acc, p, q, {}, NOW)
+        self.assertTrue(dec.approved, dec.reason)
 
-    def test_unknown_spread_policy(self):
-        c = cfg(SPREAD_UNKNOWN_ALLOWED=False)
-        self.assertEqual(Filter(c).check(cand(snap(), c), TODAY), "spread ukendt")
+    def test_usd_exposure_across_pairs(self):
+        q = quotes()
+        for sym in ("EUR_USD", "GBP_USD", "NZD_USD"):  # alle short USD: 3 % USD-risiko
+            self.acc.positions.append(Position(sym, "standard", sym, "long", 1000, q[sym].mid, 0, 0, None,
+                                               0, 0, NOW.isoformat(), 1.0, 70))
+        dec = Risk().run(TradeIntent("standard", make_signal("AUD_USD", 0.66), "long", 80, "t"),
+                         self.acc, self.p, q, {}, NOW)
+        self.assertFalse(dec.approved)
+        self.assertIn("USD-eksponering", dec.reason)
+        # long USD_JPY reducerer USD-eksponeringen -> tilladt
+        dec = Risk().run(TradeIntent("standard", make_signal("USD_JPY", 150.0, 0.3), "long", 80, "t"),
+                         self.acc, self.p, q, {}, NOW)
+        self.assertTrue(dec.approved, dec.reason)
+
+    def test_daily_loss_cap(self):
+        self.acc.day_start_equity = config.START_EQUITY
+        self.acc.balance = config.START_EQUITY * 0.96
+        dec = Risk().run(self.intent(), self.acc, self.p, quotes(), {}, NOW)
+        self.assertFalse(dec.approved)
+        self.assertIn("tabsloft", dec.reason)
+
+    def test_correlated_positions(self):
+        q = quotes()
+        for sym in ("GBP_USD", "AUD_USD"):
+            self.acc.positions.append(Position(sym, "standard", sym, "long", 1, q[sym].mid, 0, 0, None, 0, 0,
+                                               NOW.isoformat(), 0.1, 70))
+        corr = {("EUR_USD", "GBP_USD"): 0.9, ("EUR_USD", "AUD_USD"): 0.85}
+        p = replace(self.p, max_ccy_risk=99)
+        dec = Risk().run(self.intent(), self.acc, p, q, corr, NOW)
+        self.assertFalse(dec.approved)
+        self.assertIn("korrelerede", dec.reason)
+
+    def test_no_new_trades_just_before_weekend(self):
+        fri = utc(2026, 11, 20, 21, 0)
+        dec = Risk().run(self.intent(), self.acc, self.p, quotes(), {}, fri)
+        self.assertFalse(dec.approved)
 
 
-class TestAnalyst(unittest.TestCase):
-    def test_score_range_and_order(self):
-        c = cfg()
-        a = Analyst(c)
-        spy = compute_features(snap("SPY"), c)
-        ctx = market_context(spy, {})
-        up = a.score_one(Passed(cand(snap("UP", trend_bars(step=0.004), volume=2e7), c)), ctx)
-        down = a.score_one(Passed(cand(snap("DN", trend_bars(step=-0.002)), c)), ctx)
-        for s in (up, down):
-            self.assertTrue(0 <= s.score <= 100)
-            self.assertEqual(set(s.components), set(c.SCORE_WEIGHTS))
-        self.assertGreater(up.score, down.score)
-        self.assertTrue(up.features["spy_uptrend"])
-
-
-class TestRisk(unittest.TestCase):
+class ExecutorTest(unittest.TestCase):
     def setUp(self):
-        self.c = cfg()
-        self.r = Risk(self.c)
-        sc = Analyst(self.c).score_one(Passed(cand(snap("AAA"), self.c)),
-                                       market_context(None, {}))
-        self.scored = sc
+        self.p = BY_NAME["standard"]
+        self.acc = accounts.new_account("standard")
+        self.q = quotes()
 
-    def test_atr_stop(self):
-        acct = new_account(100_000)
-        o, why = self.r.approve(self.scored, BY_NAME["baseline"], acct, 100_000, {})
-        self.assertEqual(why, "ok")
-        self.assertAlmostEqual(o.stop, self.scored.price - 2.0 * self.scored.features["atr"], places=3)
+    def decision(self, sym="EUR_USD", stop=0.004, d="long"):
+        intent = TradeIntent("standard", make_signal(sym, self.q[sym].mid), d, 80.0, "t")
+        return RiskDecision(intent, True, "ok", stop_distance=stop, trail_distance=0.005,
+                            trail_activate=stop, take_profit_distance=2 * stop, risk_pct=1.0)
 
-    def test_sector_cap(self):
-        acct = new_account(100_000)
-        acct["positions"]["X"] = {"qty": 250, "entry": 100, "sector": "Information Technology"}   # 25 %
-        o, why = self.r.approve(self.scored, BY_NAME["baseline"], acct, 100_000, {"X": 100})
-        self.assertIsNone(o)
-        self.assertIn("sektorloft", why)
+    def test_fixed_percent_risk_sizing(self):
+        res = Executor().run(self.decision(), self.acc, self.p, self.q, NOW)
+        self.assertTrue(res.filled)
+        pos = self.acc.positions[0]
+        loss = accounts.pnl_usd(pos, pos.stop, self.q)
+        self.assertAlmostEqual(-loss / config.START_EQUITY * 100, 1.0, places=2)
+        self.assertEqual(pos.entry, self.q["EUR_USD"].ask)  # long købes på ask (spread betales)
 
-    def test_trailing_and_exits(self):
-        strat = BY_NAME["baseline"]
-        pos = {"entry": 100, "stop": 96, "trail": None, "trail_mult": 3, "atr": 2, "high": 100,
-               "opened": "2025-01-02T10:00:00"}
-        self.assertIsNone(self.r.review(strat, "A", pos, None, TODAY, 110))
-        self.assertAlmostEqual(pos["trail"], 104)                     # 110 - 3*2
-        self.assertEqual(self.r.review(strat, "A", pos, None, TODAY, 103.9), "trailing stop")
-        pos2 = {"entry": 100, "stop": 96, "trail": None, "trail_mult": 3, "atr": 2, "high": 100,
-                "opened": "2025-01-02T10:00:00"}
-        self.assertEqual(self.r.review(strat, "A", pos2, None, TODAY, 95), "stop")
-        pos3 = dict(pos2, trail=None, high=100, opened="2024-11-01T10:00:00")
-        self.assertEqual(self.r.review(strat, "A", pos3, None, TODAY, 100), "maks. holdetid")
-        tp = BY_NAME["quick_swing"]
-        pos4 = dict(pos2, trail=None, high=100)
-        self.assertEqual(self.r.review(tp, "A", pos4, None, TODAY, 104.5), "gevinstmål")
+    def test_jpy_cross_sizing_converts(self):
+        res = Executor().run(self.decision("EUR_JPY", stop=0.6), self.acc, self.p, self.q, NOW)
+        pos = self.acc.positions[0]
+        loss = accounts.pnl_usd(pos, pos.stop, self.q)
+        self.assertTrue(res.filled)
+        self.assertAlmostEqual(-loss / config.START_EQUITY * 100, 1.0, places=2)
 
+    def test_max_positions_and_quarantine(self):
+        p = replace(self.p, max_positions=1)
+        ex = Executor()
+        self.assertTrue(ex.run(self.decision(), self.acc, p, self.q, NOW).filled)
+        r = ex.run(self.decision("GBP_USD"), self.acc, p, self.q, NOW)
+        self.assertFalse(r.filled)
+        self.assertIn("maks", r.reason)
+        pos = self.acc.positions[0]
+        ex.close(self.acc, pos, pos.entry, "test", self.q, NOW, p)
+        r = ex.run(self.decision(), self.acc, p, self.q, NOW + timedelta(minutes=5))
+        self.assertFalse(r.filled)
+        self.assertIn("karantæne", r.reason)
+        r = ex.run(self.decision(), self.acc, p, self.q, NOW + timedelta(minutes=p.quarantine_min + 1))
+        self.assertTrue(r.filled)
 
-class TestExecutor(unittest.TestCase):
-    def setUp(self):
-        self.c = cfg()
-        self.e = Executor(self.c)
-        self.now = datetime(2025, 1, 2, 10, 0, tzinfo=NY)
-        self.s = Strategy("t", "T", "", max_positions=2, position_pct=0.1)
+    def test_stop_hit_closes_near_minus_1r(self):
+        ex = Executor()
+        ex.run(self.decision(), self.acc, self.p, self.q, NOW)
+        pos = self.acc.positions[0]
+        md = FakeMD(NOW + timedelta(minutes=15))
+        from desk.models import Candle
+        md.c[("EUR_USD", "M15")] = [Candle(NOW, pos.entry, pos.entry + 0.0005, pos.stop - 0.001, pos.stop)]
+        closed = ex.manage(self.acc, md, self.q, NOW + timedelta(minutes=15), self.p)
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["reason"], "stop")
+        self.assertLess(closed[0]["r_multiple"], -0.95)
+        self.assertGreater(closed[0]["r_multiple"], -1.15)
+        self.assertIn("EUR_USD", self.acc.quarantine)
 
-    def order(self, sym="AAA", px=100.0):
-        return Order("t", sym, "buy", px, "test", "Tech", 95.0, 2.0, 3.0)
+    def test_trailing_stop_moves(self):
+        ex = Executor()
+        ex.run(self.decision(), self.acc, self.p, self.q, NOW)
+        pos = self.acc.positions[0]
+        from desk.models import Candle
+        md = FakeMD(NOW + timedelta(minutes=15))
+        hi = pos.entry + 0.010
+        md.c[("EUR_USD", "M15")] = [Candle(NOW, pos.entry, hi, pos.entry - 0.0001, hi - 0.001)]
+        ex.manage(self.acc, md, self.q, NOW + timedelta(minutes=15), replace(self.p, tp_r=None))
+        if self.acc.positions:
+            self.assertGreater(self.acc.positions[0].stop, pos.initial_stop)
 
-    def test_buy_slippage_commission(self):
-        acct = new_account(100_000)
-        f, why = self.e.buy(self.order(), acct, 100_000, self.now, self.s, 30)
-        self.assertEqual(why, "ok")
-        self.assertAlmostEqual(f.price, 100 * 1.0005)
-        self.assertAlmostEqual(f.qty * f.price, 10_000, delta=1)
-        self.assertAlmostEqual(f.commission, max(1.0, f.qty * 0.005), places=3)
-        self.assertAlmostEqual(acct["positions"]["AAA"]["stop"], f.price - 5, places=4)
-
-    def test_rules(self):
-        acct = new_account(100_000)
-        self.assertEqual(self.e.buy(self.order(), acct, 1e5, self.now, self.s, 0.5)[1], "første minut efter åbning")
-        self.e.buy(self.order("A"), acct, 1e5, self.now, self.s, 30)
-        self.assertEqual(self.e.buy(self.order("A"), acct, 1e5, self.now, self.s, 30)[1], "position findes allerede")
-        self.e.buy(self.order("B"), acct, 1e5, self.now, self.s, 30)
-        self.assertEqual(self.e.buy(self.order("C"), acct, 1e5, self.now, self.s, 30)[1], "maks. antal positioner")
-
-    def test_sell_pnl_and_quarantine(self):
-        acct = new_account(100_000)
-        self.e.buy(self.order(), acct, 1e5, self.now, self.s, 30)
-        fill = self.e.sell(Order("t", "AAA", "sell", 110.0, "test"), acct, self.now)
-        self.assertGreater(fill.pnl_pct, 0.09)
-        self.assertLess(fill.pnl_pct, 0.1)
-        self.assertEqual(acct["trades"], 1)
-        self.assertEqual(acct["wins"], 1)
-        self.assertEqual(self.e.buy(self.order(), acct, 1e5, self.now + timedelta(days=1), self.s, 30)[1],
-                         "karantæne efter salg")
-        f, why = self.e.buy(self.order(), acct, 1e5, self.now + timedelta(days=4), self.s, 30)
-        self.assertEqual(why, "ok")
-
-    def test_round_trip_costs_money(self):
-        acct = new_account(100_000)
-        self.e.buy(self.order(), acct, 1e5, self.now, self.s, 30)
-        self.e.sell(Order("t", "AAA", "sell", 100.0, "flat"), acct, self.now)
-        self.assertLess(acct["cash"], 100_000)
+    def test_weekend_close(self):
+        ex = Executor()
+        ex.run(self.decision(), self.acc, self.p, self.q, NOW)
+        fri = utc(2026, 11, 20, 21, 45)
+        md = FakeMD(fri)
+        closed = ex.manage(self.acc, md, self.q, fri, self.p)
+        self.assertEqual(closed[0]["reason"], "lukket før weekend")
 
 
-class TestStrategies(unittest.TestCase):
-    def test_count_and_unique(self):
-        self.assertGreaterEqual(len(STRATEGIES), 15)
-        self.assertEqual(len({s.name for s in STRATEGIES}), len(STRATEGIES))
-        for key in ("momentum", "breakout", "mean_reversion", "gap_go", "dip_uptrend", "picky", "aggressive",
-                    "many_small"):
-            self.assertIn(key, BY_NAME)
+class SwapTest(unittest.TestCase):
+    def test_carry_direction(self):
+        q = quotes()
+        long_ = Position("a", "s", "USD_JPY", "long", 10000, 150.0, 149, 149, None, 0, 0, NOW.isoformat(), 1, 60)
+        short = Position("b", "s", "USD_JPY", "short", 10000, 150.0, 151, 151, None, 0, 0, NOW.isoformat(), 1, 60)
+        self.assertGreater(accounts.swap_usd(long_, q, 1), 0)
+        self.assertLess(accounts.swap_usd(short, q, 1), 0)
+        self.assertAlmostEqual(accounts.swap_usd(short, q, 3), 3 * accounts.swap_usd(short, q, 1))
 
 
-class TestLogger(unittest.TestCase):
-    def test_tables(self):
-        lg = Logger(":memory:", 3)
-        lg.start_cycle("regular", 10)
-        lg.event("Scout", "hej")
-        lg.handoff("Scout", "Filter", "A", {"x": 1})
-        lg.equity("baseline", 1.5)
-        lg.end_cycle(n_candidates=1)
-        self.assertEqual(lg.conn.execute("SELECT COUNT(*) FROM events WHERE epoch=3").fetchone()[0], 1)
-        self.assertEqual(lg.conn.execute("SELECT n_candidates FROM cycles").fetchone()[0], 1)
-        self.assertEqual(lg.conn.execute("SELECT COUNT(*) FROM handoffs").fetchone()[0], 1)
+class StrategyTest(unittest.TestCase):
+    def test_at_least_15_unique(self):
+        names = [s.name for s in STRATEGIES]
+        self.assertGreaterEqual(len(names), 15)
+        self.assertEqual(len(names), len(set(names)))
+        for need in ("trend", "breakout-london", "meanrev-asien", "nyhedsfilter", "kraesen",
+                     "aggressiv", "mange-smaa"):
+            self.assertIn(need, names)
+
+    def test_meanrev_only_in_asia(self):
+        s = Strategy(BY_NAME["meanrev-asien"])
+        intent, why = s.evaluate(make_signal())
+        self.assertIsNone(intent)
+        self.assertIn("session", why)
+
+    def test_standard_takes_strong_signal(self):
+        intent, _ = Strategy(BY_NAME["standard"]).evaluate(make_signal())
+        self.assertEqual(intent.direction, "long")
+
+    def test_kinds_filter(self):
+        intent, why = Strategy(BY_NAME["kun-raavarer"]).evaluate(make_signal())
+        self.assertIsNone(intent)
 
 
 if __name__ == "__main__":

@@ -1,95 +1,151 @@
-"""Analyst: scorer hver kandidat 0-100 ud fra seks komponenter:
+"""Analyst: scorer 0-100 for long og short pr. instrument.
 
-momentum, relativ styrke (mod sektor-ETF og SPY), volumen, trend,
-volatilitet (ATR i forhold til et ideelt bånd) og markedets retning (SPY).
-Output: list[Scored]. Alle scorede aktier bliver også skyggehandlet.
+Komponenter (hver giver en long- og short-score, 50 = neutral):
+  trend        – EMA-trend på M15, H1 og H4 vægtet
+  momentum     – RSI og ændringsrate på H1 målt i ATR
+  volatility   – ATR-baseret: belønner sundt udsving, straffer dødt eller kaotisk marked
+  carry        – renteforskel mellem basis- og kursvaluta
+  correlation  – bekræfter korrelerede instrumenter samme retning?
+Ekstra (bruges af specifikke strategier): breakout (sessionsrange), meanrev (Bollinger z).
 """
 from __future__ import annotations
 
-from ..models import Passed, Scored
+from datetime import timedelta
+
+from .. import config, indicators as ind, market
+from ..models import AnalystReport, FilterReport, Signal
 
 
-def clip(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    return max(lo, min(hi, x))
+def _ls(x: float) -> tuple:
+    """-1..1 -> (long, short) scorer 0..100."""
+    x = ind.clamp(x)
+    return round(50 + 50 * x, 1), round(50 - 50 * x, 1)
 
 
-def market_context(spy_f: dict | None, sector_f: dict[str, dict]) -> dict:
-    spy_f = spy_f or {}
-    up = bool(spy_f.get("sma50") and spy_f.get("sma200") and spy_f["price"] > spy_f["sma50"]
-              and spy_f["price"] > spy_f["sma200"])
-    return {"spy": spy_f, "sectors": sector_f, "spy_uptrend": up}
+def vol_score(ratio: float) -> float:
+    if ratio < 0.6:
+        return 20 + 50 * (ratio / 0.6) * 0.6
+    if ratio <= 1.6:
+        return 70 + 30 * min(1.0, (ratio - 0.6) / 0.6)
+    if ratio <= 2.5:
+        return 100 - 50 * (ratio - 1.6) / 0.9
+    return 40.0
 
 
 class Analyst:
-    name = "Analyst"
+    name = "analyst"
 
-    def __init__(self, cfg, logger=None):
-        self.cfg = cfg
-        self.log = logger
+    def __init__(self):
+        self._cache: dict = {}
 
-    def components(self, f: dict, ctx: dict, sector: str) -> tuple[dict, dict]:
-        cfg = self.cfg
-        spy = ctx.get("spy") or {}
-        extra = {}
-        # Momentum
-        r20, r60 = f.get("ret20") or 0.0, f.get("ret60") or 0.0
-        momentum = clip(50 + (0.6 * r20 + 0.4 * r60 / 2) * 500)
-        # Relativ styrke
-        etf = cfg.SECTOR_ETFS.get(sector)
-        sec_f = ctx.get("sectors", {}).get(etf) if etf else None
-        spy20 = spy.get("ret20")
-        sec20 = sec_f.get("ret20") if sec_f else spy20
-        rs_spy = r20 - spy20 if spy20 is not None else 0.0
-        rs_sec = r20 - sec20 if sec20 is not None else rs_spy
-        extra["rs_spy20"], extra["rs_sector20"] = rs_spy, rs_sec
-        rel_strength = clip(50 + (0.5 * rs_spy + 0.5 * rs_sec) * 600)
-        # Volumen
-        rvol = f.get("rvol") or 0.0
-        volume = clip((rvol - 0.5) / 2.5 * 100)
-        # Trend
-        p = f["price"]
-        trend = 0.0
-        for cond in (f.get("sma20") and p > f["sma20"],
-                     f.get("sma20") and f.get("sma50") and f["sma20"] > f["sma50"],
-                     f.get("sma50") and f.get("sma200") and f["sma50"] > f["sma200"],
-                     f.get("sma200") and p > f["sma200"]):
-            trend += 25 if cond else 0
-        # Volatilitet
-        ap = f.get("atr_pct")
-        lo, hi = cfg.IDEAL_ATR_PCT
-        if ap is None:
-            volatility = 50.0
-        elif ap < lo:
-            volatility = 60 + ap / lo * 40
-        elif ap <= hi:
-            volatility = 100.0
-        else:
-            volatility = clip(100 - (ap - hi) * 100 * 25)
-        # Marked
-        market = 0.0
-        if spy.get("sma50") and spy["price"] > spy["sma50"]:
-            market += 40
-        if spy.get("sma200") and spy["price"] > spy["sma200"]:
-            market += 30
-        market += clip(15 + (spy.get("ret5") or 0) * 300, 0, 30)
-        extra["spy_uptrend"] = ctx.get("spy_uptrend", False)
-        comps = {"momentum": momentum, "rel_strength": rel_strength, "volume": volume,
-                 "trend": trend, "volatility": volatility, "market": market}
-        return {k: round(v, 2) for k, v in comps.items()}, extra
+    def _trend(self, md, sym):
+        total, detail = 0.0, {}
+        for tf, w in config.TREND_TF_WEIGHTS.items():
+            cs = md.candles(sym, tf)
+            key = ("trend", sym, tf, cs[-1].time if cs else None)
+            if key not in self._cache:
+                closes = [c.close for c in cs]
+                self._cache[key] = ind.trend_strength(closes, config.EMA_FAST, config.EMA_SLOW,
+                                                      ind.atr(cs, config.ATR_LEN))
+            detail[tf] = round(self._cache[key], 3)
+            total += w * self._cache[key]
+        return total, detail
 
-    def score_one(self, p: Passed, ctx: dict) -> Scored:
-        c = p.candidate
-        comps, extra = self.components(c.features, ctx, c.snapshot.sector)
-        w = self.cfg.SCORE_WEIGHTS
-        score = sum(comps[k] * w.get(k, 0) for k in comps) / (sum(w.values()) or 1)
-        feats = {**c.features, **extra}
-        return Scored(c.symbol, round(score, 2), comps, c.signals, feats, c.snapshot.sector,
-                      c.snapshot.is_etf, c.snapshot.price)
-
-    def run(self, passed: list[Passed], ctx: dict) -> list[Scored]:
-        out = sorted((self.score_one(p, ctx) for p in passed), key=lambda s: s.score, reverse=True)
-        if self.log:
-            self.log.event(self.name, f"{len(out)} scoret", data={"top": [(s.symbol, s.score) for s in out[:15]]})
-            for s in out:
-                self.log.handoff(self.name, "Risk", s.symbol, {"score": s.score, "components": s.components})
+    def correlations(self, md, symbols) -> dict:
+        rets = {}
+        for s in symbols:
+            cs = md.candles(s, "H1")[-(config.CORR_LOOKBACK + 1):]
+            rets[s] = ind.returns([c.close for c in cs])
+        out = {}
+        for i, a in enumerate(symbols):
+            for b in symbols[i + 1:]:
+                ta = md.candles(a, "H1")[-1].time if md.candles(a, "H1") else None
+                key = ("corr", a, b, ta)
+                if key not in self._cache:
+                    self._cache[key] = round(ind.correlation(rets[a], rets[b]), 3)
+                out[(a, b)] = out[(b, a)] = self._cache[key]
         return out
+
+    def _session_range(self, m15, now, hours_back_start, hours_back_end):
+        lo_t, hi_t = now - timedelta(hours=hours_back_start), now - timedelta(hours=hours_back_end)
+        w = [c for c in m15 if lo_t <= c.time < hi_t]
+        if len(w) < 4:
+            return None
+        return max(c.high for c in w), min(c.low for c in w)
+
+    def run(self, report: FilterReport, md) -> AnalystReport:
+        now = report.time
+        if len(self._cache) > 20000:
+            self._cache.clear()
+        all_syms = [s for s in config.INSTRUMENTS if len(md.candles(s, "H1")) > 30]
+        corr = self.correlations(md, all_syms)
+        trends = {}
+        for s in all_syms:
+            trends[s] = self._trend(md, s)[0]
+        signals = []
+        for fp in report.passed:
+            sym = fp.pick.instrument
+            ins = market.instrument(sym)
+            m15, h1 = md.candles(sym, "M15"), md.candles(sym, "H1")
+            price = m15[-1].close
+            atr15, atr1 = ind.atr(m15, config.ATR_LEN), ind.atr(h1, config.ATR_LEN)
+            comps, ctx = {}, {}
+
+            t, tdet = self._trend(md, sym)
+            comps["trend"] = _ls(t)
+            ctx["trend_tf"] = tdet
+
+            closes1 = [c.close for c in h1]
+            r = ind.rsi(closes1[-100:], config.RSI_LEN)
+            roc = (closes1[-1] - closes1[-13]) / (2 * atr1) if len(closes1) > 13 and atr1 else 0
+            comps["momentum"] = _ls(0.5 * ind.clamp((r - 50) / 25) + 0.5 * ind.clamp(roc))
+            ctx["rsi_h1"] = round(r, 1)
+
+            v = round(vol_score(fp.pick.atr_ratio), 1)
+            comps["volatility"] = (v, v)
+
+            rb = config.POLICY_RATES.get(ins.base, 0.0)
+            rq = config.POLICY_RATES.get(ins.quote, 0.0)
+            comps["carry"] = _ls((rb - rq) / config.CARRY_FULL_SCALE_PCT)
+            ctx["rate_diff"] = round(rb - rq, 2)
+
+            conf, wsum, peers = 0.0, 0.0, []
+            for other in all_syms:
+                if other == sym:
+                    continue
+                rho = corr.get((sym, other), 0.0)
+                if abs(rho) >= config.CORR_MIN:
+                    conf += rho * trends[other]
+                    wsum += abs(rho)
+                    peers.append((other, rho))
+            c = conf / wsum if wsum else 0.0
+            comps["correlation"] = _ls(c * (1 if t * c >= 0 else 0.5)) if wsum else (50.0, 50.0)
+            ctx["peers"] = sorted(peers, key=lambda x: -abs(x[1]))[:4]
+
+            # ekstra: breakout af seneste 6 timers range (før nuværende time) og Bollinger z
+            rng = self._session_range(m15, now, 7, 1)
+            if rng:
+                hi, lo = rng
+                up = (price - hi) / atr15 if atr15 else 0
+                dn = (lo - price) / atr15 if atr15 else 0
+                comps["breakout"] = (round(50 + 50 * ind.clamp(up, -1, 1), 1),
+                                     round(50 + 50 * ind.clamp(dn, -1, 1), 1))
+                ctx["range"] = (hi, lo)
+            else:
+                comps["breakout"] = (50.0, 50.0)
+            closes15 = [x.close for x in m15]
+            sd = ind.stdev(closes15, config.BB_LEN)
+            z = (price - ind.sma(closes15, config.BB_LEN)) / (2 * sd) if sd else 0.0
+            r15 = ind.rsi(closes15[-60:], config.RSI_LEN)
+            mr = -0.6 * ind.clamp(z) - 0.4 * ind.clamp((r15 - 50) / 25)
+            comps["meanrev"] = _ls(mr)
+            ctx["z"] = round(z, 2)
+            ctx["sessions"] = report.market.sessions
+            ctx["minutes_in"] = {g: market.minutes_into_session(g, now) for g in report.market.sessions}
+
+            w = config.DEFAULT_WEIGHTS
+            long_s = sum(w[k] * comps[k][0] for k in w) / sum(w.values())
+            short_s = sum(w[k] * comps[k][1] for k in w) / sum(w.values())
+            signals.append(Signal(sym, now, price, atr1, atr15, round(long_s, 1), round(short_s, 1),
+                                  comps, ctx, fp))
+        return AnalystReport(now, report.market, tuple(signals), corr)
