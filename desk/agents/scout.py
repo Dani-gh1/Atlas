@@ -1,38 +1,61 @@
-"""Scout: vælger instrumenter i aktive sessioner med nok udsving."""
+"""Scout: finder kandidater i hele universet.
+
+Signaler: stor relativ volumen ('rvol'), gap op/ned ('gap_up'/'gap_down'),
+ny 52-ugers top ('new_high52') og – hvis slået til – 'pullback' og 'oversold'
+som dip-køb/mean reversion-regelsættene bruger.
+Output: list[Candidate] (sorteret efter prioritet).
+"""
 from __future__ import annotations
 
-from datetime import datetime
-
-from .. import config, indicators as ind, market
-from ..models import ScoutPick, ScoutReport
+from ..indicators import compute_features
+from ..models import Candidate, Snapshot
 
 
 class Scout:
-    name = "scout"
+    name = "Scout"
 
-    def run(self, now: datetime, md) -> ScoutReport:
-        st = market.status(now)
-        picks, skipped = [], []
-        if not st.open:
-            return ScoutReport(now, st, (), tuple((s, "marked lukket") for s in config.INSTRUMENTS))
-        for sym in config.INSTRUMENTS:
-            if not market.is_instrument_open(sym, now):
-                skipped.append((sym, "instrument holder pause"))
+    def __init__(self, cfg, logger=None):
+        self.cfg = cfg
+        self.log = logger
+
+    def signals_for(self, f: dict) -> list[str]:
+        c = self.cfg
+        sig = []
+        if f.get("rvol") is not None and f["rvol"] >= c.SCOUT_MIN_RVOL:
+            sig.append("rvol")
+        if f.get("gap", 0) >= c.SCOUT_GAP_PCT:
+            sig.append("gap_up")
+        if f.get("gap", 0) <= -c.SCOUT_GAP_PCT:
+            sig.append("gap_down")
+        if f.get("new_high52"):
+            sig.append("new_high52")
+        if c.SCOUT_EXTRA_SIGNALS:
+            if (f.get("sma50") and f.get("sma20") and f.get("ret5") is not None
+                    and f["price"] > f["sma50"] and f["price"] < f["sma20"] and f["ret5"] <= c.SCOUT_PULLBACK_RET5):
+                sig.append("pullback")
+            if (f.get("rsi2") is not None and f.get("sma200") and f["rsi2"] < c.SCOUT_OVERSOLD_RSI2
+                    and f["price"] > f["sma200"]):
+                sig.append("oversold")
+        return sig
+
+    def run(self, snapshots: dict[str, Snapshot], features: dict[str, dict] | None = None) -> list[Candidate]:
+        out = []
+        for sym, snap in snapshots.items():
+            f = features.get(sym) if features else None
+            if f is None:
+                f = compute_features(snap, self.cfg)
+                if features is not None:
+                    features[sym] = f
+            sig = self.signals_for(f)
+            if not sig:
                 continue
-            h1 = md.candles(sym, "H1")
-            if len(h1) < config.EMA_SLOW + 10:
-                skipped.append((sym, "for lidt historik"))
-                continue
-            ratio = ind.atr_ratio(h1, config.ATR_LEN, config.ATR_MEDIAN_LOOKBACK)
-            own = tuple(s for s in st.sessions if s in config.INSTRUMENT_SESSIONS.get(sym, ()))
-            need = config.SCOUT_MIN_ATR_RATIO if own else config.SCOUT_OFFSESSION_ATR_RATIO
-            if ratio < need:
-                why = "uden for egen session" if not own else "for lidt udsving"
-                skipped.append((sym, f"{why} (ATR-ratio {ratio:.2f} < {need:.2f})"))
-                continue
-            reason = (f"session {'+'.join(own)}" if own else "stort udsving uden for egen session")
-            picks.append(ScoutPick(sym, round(ratio, 3), own, f"{reason}, ATR-ratio {ratio:.2f}"))
-        picks.sort(key=lambda p: (0 if p.sessions else 1, -p.atr_ratio))
-        keep = picks[:config.SCOUT_MAX_CANDIDATES]
-        skipped += [(p.instrument, "uden for top-liste") for p in picks[config.SCOUT_MAX_CANDIDATES:]]
-        return ScoutReport(now, st, tuple(keep), tuple(skipped))
+            prio = (f.get("rvol") or 0) + abs(f.get("gap") or 0) * 50 + (1.0 if f.get("new_high52") else 0) + len(sig) * 0.5
+            out.append(Candidate(sym, tuple(sig), round(prio, 3), f, snap))
+        out.sort(key=lambda c: c.priority, reverse=True)
+        out = out[: self.cfg.SCOUT_MAX_CANDIDATES]
+        if self.log:
+            self.log.event(self.name, f"{len(out)} kandidater af {len(snapshots)} symboler",
+                           data={"top": [(c.symbol, c.signals) for c in out[:15]]})
+            for c in out:
+                self.log.handoff(self.name, "Filter", c.symbol, {"signals": c.signals, "priority": c.priority})
+        return out

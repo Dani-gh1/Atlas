@@ -1,139 +1,119 @@
-"""Logger: den ENESTE der skriver til SQLite. Hver overdragelse logges."""
+"""Logger: den eneste agent der skriver til SQLite. Alt logges:
+cyklusser, hændelser, overdragelser mellem agenter, handler, egenkapital og skyggehandler.
+"""
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS epochs(id INTEGER PRIMARY KEY, started_at TEXT, reason TEXT);
-CREATE TABLE IF NOT EXISTS ticks(id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, epoch INTEGER,
-  market TEXT, sessions TEXT, scouted INTEGER, passed INTEGER, signals INTEGER, errors TEXT);
-CREATE TABLE IF NOT EXISTS scout(tick INTEGER, instrument TEXT, picked INTEGER, atr_ratio REAL, reason TEXT);
-CREATE TABLE IF NOT EXISTS filter(tick INTEGER, instrument TEXT, passed INTEGER, reason TEXT,
-  spread_atr REAL, minutes_to_news REAL);
-CREATE TABLE IF NOT EXISTS signals(tick INTEGER, time TEXT, instrument TEXT, long REAL, short REAL,
-  components TEXT, context TEXT);
-CREATE TABLE IF NOT EXISTS decisions(tick INTEGER, time TEXT, epoch INTEGER, strategy TEXT,
-  instrument TEXT, direction TEXT, score REAL, stage TEXT, approved INTEGER, reason TEXT);
-CREATE TABLE IF NOT EXISTS trades(id TEXT PRIMARY KEY, epoch INTEGER, strategy TEXT, instrument TEXT,
-  direction TEXT, opened_at TEXT, closed_at TEXT, entry REAL, exit REAL, reason TEXT, score REAL,
-  risk_pct REAL, pnl_pct REAL, swap_pct REAL, r_multiple REAL, spread_cost_pct REAL);
-CREATE TABLE IF NOT EXISTS equity(time TEXT, epoch INTEGER, strategy TEXT, return_pct REAL,
-  open_positions INTEGER);
-CREATE TABLE IF NOT EXISTS shadows(id TEXT PRIMARY KEY, epoch INTEGER, instrument TEXT, direction TEXT,
-  score REAL, opened_at TEXT, entry REAL, stop REAL, tp REAL, closed_at TEXT, outcome TEXT, r REAL);
-CREATE TABLE IF NOT EXISTS events(time TEXT, level TEXT, kind TEXT, message TEXT);
-CREATE INDEX IF NOT EXISTS ix_equity ON equity(epoch, strategy, time);
-CREATE INDEX IF NOT EXISTS ix_trades ON trades(epoch, strategy);
-CREATE INDEX IF NOT EXISTS ix_signals ON signals(tick);
+CREATE TABLE IF NOT EXISTS cycles(id INTEGER PRIMARY KEY, ts TEXT, epoch INT, session TEXT,
+    n_universe INT, n_candidates INT, n_passed INT, n_scored INT, n_buys INT, n_sells INT,
+    duration_s REAL, note TEXT);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts TEXT, epoch INT, cycle_id INT,
+    agent TEXT, level TEXT, symbol TEXT, message TEXT, data TEXT);
+CREATE TABLE IF NOT EXISTS handoffs(id INTEGER PRIMARY KEY, ts TEXT, epoch INT, cycle_id INT,
+    from_agent TEXT, to_agent TEXT, symbol TEXT, payload TEXT);
+CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY, ts TEXT, epoch INT, strategy TEXT,
+    symbol TEXT, side TEXT, qty REAL, price REAL, commission REAL, slippage REAL, reason TEXT,
+    pnl_pct REAL, hold_days INT, weight_pct REAL);
+CREATE TABLE IF NOT EXISTS equity(id INTEGER PRIMARY KEY, ts TEXT, epoch INT, strategy TEXT,
+    return_pct REAL);
+CREATE TABLE IF NOT EXISTS shadow(id INTEGER PRIMARY KEY, ts TEXT, day TEXT, epoch INT, symbol TEXT,
+    score REAL, price REAL, signals TEXT, components TEXT, ret_1 REAL, ret_5 REAL, ret_10 REAL,
+    done INT DEFAULT 0, UNIQUE(day, epoch, symbol));
+CREATE INDEX IF NOT EXISTS ix_events_epoch ON events(epoch, id);
+CREATE INDEX IF NOT EXISTS ix_trades_epoch ON trades(epoch, id);
+CREATE INDEX IF NOT EXISTS ix_equity_epoch ON equity(epoch, strategy, ts);
+CREATE INDEX IF NOT EXISTS ix_handoffs_cycle ON handoffs(cycle_id);
 """
 
 
-def _j(x) -> str:
-    return json.dumps(x, default=str, ensure_ascii=False)
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class Logger:
-    name = "logger"
+    name = "Logger"
 
-    def __init__(self, path: Path, verbose: bool = True):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(path), check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=NORMAL")
-        self.db.executescript(SCHEMA)
-        self.verbose = verbose  # backtest slår signal-/scout-detaljer fra for fart
-        self.tick_id = 0
+    def __init__(self, db_path: Path | str, epoch: int, log_handoffs: bool = True, echo: bool = False):
+        self.path = str(db_path)
+        if self.path != ":memory:":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self.conn.execute("PRAGMA journal_mode=WAL") if self.path != ":memory:" else None
+        self.conn.executescript(SCHEMA)
+        self.lock = threading.Lock()
+        self.epoch = epoch
+        self.cycle_id: int | None = None
+        self.log_handoffs = log_handoffs
+        self.echo = echo
+        self.clock_override: str | None = None   # backtest sætter simuleret tid
 
-    # ------------------------------------------------------------ pipeline
-    def begin_tick(self, now, epoch, market_status, errors=()):
-        cur = self.db.execute(
-            "INSERT INTO ticks(time, epoch, market, sessions, errors) VALUES(?,?,?,?,?)",
-            (now.isoformat(), epoch, market_status.label, ",".join(market_status.sessions),
-             _j(list(errors))))
-        self.tick_id = cur.lastrowid
-        return self.tick_id
+    def _ts(self) -> str:
+        return self.clock_override or now_iso()
 
-    def scout(self, rep):
-        if self.verbose:
-            rows = [(self.tick_id, p.instrument, 1, p.atr_ratio, p.reason) for p in rep.picks]
-            rows += [(self.tick_id, s, 0, None, r) for s, r in rep.skipped]
-            self.db.executemany("INSERT INTO scout VALUES(?,?,?,?,?)", rows)
-        self.db.execute("UPDATE ticks SET scouted=? WHERE id=?", (len(rep.picks), self.tick_id))
+    def _x(self, sql: str, args=()):
+        with self.lock:
+            return self.conn.execute(sql, args)
 
-    def filter(self, rep):
-        if self.verbose:
-            rows = [(self.tick_id, f.pick.instrument, 1, "ok", f.spread_atr, f.minutes_to_news)
-                    for f in rep.passed]
-            rows += [(self.tick_id, s, 0, r, None, None) for s, r in rep.killed]
-            self.db.executemany("INSERT INTO filter VALUES(?,?,?,?,?,?)", rows)
-        self.db.execute("UPDATE ticks SET passed=? WHERE id=?", (len(rep.passed), self.tick_id))
-
-    def analyst(self, rep):
-        if self.verbose:
-            self.db.executemany("INSERT INTO signals VALUES(?,?,?,?,?,?,?)", [
-                (self.tick_id, s.time.isoformat(), s.instrument, s.long_score, s.short_score,
-                 _j(s.components), _j(s.context)) for s in rep.signals])
-        self.db.execute("UPDATE ticks SET signals=? WHERE id=?", (len(rep.signals), self.tick_id))
-
-    def decision(self, now, epoch, strategy, instrument, direction, score, stage, approved, reason):
-        self.db.execute("INSERT INTO decisions VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (self.tick_id, now.isoformat(), epoch, strategy, instrument, direction,
-                         score, stage, int(approved), reason))
-
-    # ------------------------------------------------------------ handler og konti
-    def trade_open(self, res, epoch):
-        i = res.decision.intent
-        self.db.execute(
-            "INSERT OR REPLACE INTO trades(id, epoch, strategy, instrument, direction, opened_at,"
-            " entry, score, risk_pct, spread_cost_pct) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (res.position_id, epoch, i.strategy, i.signal.instrument, i.direction,
-             i.signal.time.isoformat(timespec="seconds"), res.entry, i.score,
-             res.decision.risk_pct, res.spread_cost_pct))
-
-    def trade_close(self, t: dict, epoch):
-        cur = self.db.execute(
-            "UPDATE trades SET closed_at=?, exit=?, reason=?, pnl_pct=?, swap_pct=?, r_multiple=?,"
-            " risk_pct=? WHERE id=?",
-            (t["closed_at"], t["exit"], t["reason"], t["pnl_pct"], t["swap_pct"], t["r_multiple"],
-             t["risk_pct"], t["id"]))
-        if cur.rowcount == 0:  # fx åbnet før databasen blev nulstillet
-            self.db.execute(
-                "INSERT INTO trades(id, epoch, strategy, instrument, direction, opened_at, closed_at,"
-                " entry, exit, reason, score, risk_pct, pnl_pct, swap_pct, r_multiple)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (t["id"], epoch, t["strategy"], t["instrument"], t["direction"], t["opened_at"],
-                 t["closed_at"], t["entry"], t["exit"], t["reason"], t["score"], t["risk_pct"],
-                 t["pnl_pct"], t["swap_pct"], t["r_multiple"]))
-
-    def equity(self, now, epoch, rows):
-        self.db.executemany("INSERT INTO equity VALUES(?,?,?,?,?)",
-                            [(now.isoformat(timespec="seconds"), epoch, s, r, n) for s, r, n in rows])
-
-    def shadow_open(self, sh: dict, epoch):
-        self.db.execute(
-            "INSERT OR IGNORE INTO shadows(id, epoch, instrument, direction, score, opened_at, entry,"
-            " stop, tp) VALUES(?,?,?,?,?,?,?,?,?)",
-            (sh["id"], epoch, sh["instrument"], sh["direction"], sh["score"], sh["opened_at"],
-             sh["entry"], sh["stop"], sh["tp"]))
-
-    def shadow_close(self, sh: dict):
-        self.db.execute("UPDATE shadows SET closed_at=?, outcome=?, r=? WHERE id=?",
-                        (sh["closed_at"], sh["outcome"], sh["r"], sh["id"]))
-
-    def epoch(self, epoch_id, now, reason):
-        self.db.execute("INSERT OR REPLACE INTO epochs VALUES(?,?,?)",
-                        (epoch_id, now.isoformat(timespec="seconds"), reason))
-        self.commit()
-
-    def event(self, now, level, kind, message):
-        self.db.execute("INSERT INTO events VALUES(?,?,?,?)",
-                        (now.isoformat(timespec="seconds"), level, kind, message))
+    def begin(self):
+        with self.lock:
+            self.conn.execute("BEGIN")
 
     def commit(self):
-        self.db.commit()
+        with self.lock:
+            if self.conn.in_transaction:
+                self.conn.execute("COMMIT")
 
-    def close(self):
-        self.db.commit()
-        self.db.close()
+    def start_cycle(self, session: str, n_universe: int) -> int:
+        cur = self._x("INSERT INTO cycles(ts, epoch, session, n_universe) VALUES(?,?,?,?)",
+                      (self._ts(), self.epoch, session, n_universe))
+        self.cycle_id = cur.lastrowid
+        return self.cycle_id
+
+    def end_cycle(self, **kw):
+        if self.cycle_id is None:
+            return
+        cols = ", ".join(f"{k}=?" for k in kw)
+        self._x(f"UPDATE cycles SET {cols} WHERE id=?", (*kw.values(), self.cycle_id))
+
+    def event(self, agent: str, message: str, level: str = "info", symbol: str | None = None, data=None):
+        if self.echo:
+            print(f"[{self._ts()}] {agent}: {message}", flush=True)
+        self._x("INSERT INTO events(ts, epoch, cycle_id, agent, level, symbol, message, data) VALUES(?,?,?,?,?,?,?,?)",
+                (self._ts(), self.epoch, self.cycle_id, agent, level, symbol, message,
+                 json.dumps(data, default=str) if data is not None else None))
+
+    def handoff(self, src: str, dst: str, symbol: str, payload: dict):
+        if not self.log_handoffs:
+            return
+        self._x("INSERT INTO handoffs(ts, epoch, cycle_id, from_agent, to_agent, symbol, payload) VALUES(?,?,?,?,?,?,?)",
+                (self._ts(), self.epoch, self.cycle_id, src, dst, symbol, json.dumps(payload, default=str)))
+
+    def trade(self, fill, weight: float | None = None):
+        self._x("INSERT INTO trades(ts, epoch, strategy, symbol, side, qty, price, commission, slippage, reason, pnl_pct, hold_days, weight_pct) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (fill.ts, self.epoch, fill.strategy, fill.symbol, fill.side, fill.qty, fill.price,
+                 fill.commission, fill.slippage, fill.reason,
+                 fill.pnl_pct * 100 if fill.pnl_pct is not None else None, fill.hold_days,
+                 weight * 100 if weight is not None else None))
+
+    def equity(self, strategy: str, return_pct: float, ts: str | None = None):
+        self._x("INSERT INTO equity(ts, epoch, strategy, return_pct) VALUES(?,?,?,?)",
+                (ts or self._ts(), self.epoch, strategy, return_pct))
+
+    def shadow(self, day: str, scored) -> None:
+        self._x("INSERT OR IGNORE INTO shadow(ts, day, epoch, symbol, score, price, signals, components) VALUES(?,?,?,?,?,?,?,?)",
+                (self._ts(), day, self.epoch, scored.symbol, scored.score, scored.price,
+                 ",".join(scored.signals), json.dumps(scored.components)))
+
+    def open_shadows(self):
+        return self._x("SELECT id, day, symbol, price FROM shadow WHERE done=0 AND epoch=?", (self.epoch,)).fetchall()
+
+    def update_shadow(self, sid: int, rets: dict, done: bool):
+        self._x("UPDATE shadow SET ret_1=?, ret_5=?, ret_10=?, done=? WHERE id=?",
+                (rets.get(1), rets.get(5), rets.get(10), int(done), sid))

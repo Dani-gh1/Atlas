@@ -1,32 +1,37 @@
-"""ntfy-notifikationer (https://ntfy.sh). Slået fra når NTFY_TOPIC ikke er sat."""
+"""Notifikationer via ntfy (https://ntfy.sh eller egen server). Fejl ignoreres."""
 from __future__ import annotations
 
+import threading
 import urllib.request
-
-from . import config
 
 
 class Notifier:
-    def __init__(self, topic: str | None = None, url: str | None = None):
-        self.topic = topic if topic is not None else config.NTFY_TOPIC
-        self.url = (url or config.NTFY_URL).rstrip("/")
-        self.sent: list = []  # til tests / fejlsøgning
+    def __init__(self, cfg):
+        self.cfg = cfg
 
     @property
     def enabled(self) -> bool:
-        return bool(self.topic)
+        return bool(self.cfg.NTFY_TOPIC)
 
-    def send(self, title: str, message: str, priority: str = "default", tags: str = "") -> bool:
-        self.sent.append((title, message))
+    def send(self, message: str, title: str = "Papirdesk", tags: str = "", priority: str = "default",
+             blocking: bool = False) -> bool:
         if not self.enabled:
             return False
-        headers = {"Title": title.encode("utf-8").decode("latin-1", "ignore"), "Priority": priority}
+        url = f"{self.cfg.NTFY_SERVER.rstrip('/')}/{self.cfg.NTFY_TOPIC}"
+        # HTTP-headere skal være latin-1; ntfy accepterer RFC 2047 til titler med andre tegn.
+        safe_title = title.encode("latin-1", "replace").decode("latin-1")
+        headers = {"Title": safe_title, "Priority": priority}
         if tags:
             headers["Tags"] = tags
-        req = urllib.request.Request(f"{self.url}/{self.topic}", data=message.encode("utf-8"),
-                                     headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=10):
+
+        def go():
+            try:
+                req = urllib.request.Request(url, data=message.encode("utf-8"), headers=headers, method="POST")
+                urllib.request.urlopen(req, timeout=10).read()
                 return True
-        except Exception:
-            return False  # notifikationer må aldrig vælte botten
+            except Exception:  # noqa: BLE001
+                return False
+        if blocking:
+            return go()
+        threading.Thread(target=go, daemon=True).start()
+        return True

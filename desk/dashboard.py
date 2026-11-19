@@ -1,6 +1,7 @@
-"""Dansk, mobilvenligt dashboard på port 8787 (kun læsning – ingen knapper der handler).
+"""Lokalt dashboard (dansk, mobilvenligt) på http://<host>:8787.
 
-Læser state.json (live-tilstand) og SQLite (historik). Alle beløb vises i procent.
+Kun læsning: data hentes fra state.json (papirbogen) og SQLite (Logger).
+Papirpenge vises ALTID i procent – ingen beløb forlader denne server.
 """
 from __future__ import annotations
 
@@ -9,213 +10,237 @@ import sqlite3
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
-from . import config, market, state as state_io
+import config as _cfg
+from .market_clock import MarketClock
 from .strategies import STRATEGIES
 
-UTC = timezone.utc
-WEB = Path(__file__).resolve().parent / "web" / "index.html"
+STATIC = Path(__file__).resolve().parent / "static"
 
-
-def _db():
-    if not config.DB_PATH.exists():
-        return None
-    db = sqlite3.connect(f"file:{config.DB_PATH}?mode=ro", uri=True, timeout=5)
-    db.row_factory = sqlite3.Row
-    return db
-
-
-def _max_dd(values: list) -> float:
-    peak, dd = None, 0.0
-    for r in values:
-        eq = 100 + r
-        peak = eq if peak is None else max(peak, eq)
-        dd = max(dd, (peak - eq) / peak * 100)
-    return round(dd, 2)
-
-
-def equity_series(db, epoch: int) -> dict:
-    if db is None:
-        return {}
-    span = db.execute("SELECT MIN(time), MAX(time) FROM equity WHERE epoch=?", (epoch,)).fetchone()
-    if not span or not span[0]:
-        return {}
-    days = (datetime.fromisoformat(span[1]) - datetime.fromisoformat(span[0])).days
-    width = 16 if days <= 3 else 13 if days <= 45 else 10  # minut-10 / time / dag
-    if days <= 3:
-        rows = db.execute("SELECT strategy, MAX(time) t, return_pct FROM equity WHERE epoch=? "
-                          "GROUP BY strategy, substr(time,1,15) ORDER BY t", (epoch,))
-    else:
-        rows = db.execute("SELECT strategy, MAX(time) t, return_pct FROM equity WHERE epoch=? "
-                          f"GROUP BY strategy, substr(time,1,{width}) ORDER BY t", (epoch,))
-    out: dict = {}
-    for r in rows:
-        out.setdefault(r[0], []).append([r[1], round(r[2], 3)])
-    return out
-
-
-def overview() -> dict:
-    st = state_io.load(config.STATE_PATH)
-    now = datetime.now(UTC)
-    ms = market.status(now)
-    hb = st.get("heartbeat")
-    age = (now - datetime.fromisoformat(hb)).total_seconds() / 60 if hb else None
-    epoch = st.get("epoch", 1)
-    db = _db()
-    series = equity_series(db, epoch)
-    if db:
-        db.close()
-    titles = {s.name: s.title for s in STRATEGIES}
-    rets = st.get("returns", {})
-    return {
-        "now": now.isoformat(timespec="seconds"),
-        "market": {"open": ms.open, "label": ms.label, "sessions": [config.SESSION_NAMES_DA[s] for s in ms.sessions],
-                   "next_change": ms.next_change.isoformat() if ms.next_change else None,
-                   "trading_day": ms.trading_day},
-        "bot": {"heartbeat": hb, "age_min": round(age, 1) if age is not None else None,
-                "provider": st.get("provider"), "epoch": epoch,
-                "epoch_started": st.get("meta", {}).get("epoch_started"),
-                "errors": st.get("errors", [])},
-        "returns": [{"name": n, "title": titles.get(n, n), "return_pct": r} for n, r in
-                    sorted(rets.items(), key=lambda x: -x[1])],
-        "series": series,
-        "titles": titles,
-        "open_positions": st.get("open_positions", []),
-        "news": st.get("news", []),
-    }
-
-
-def strategies() -> dict:
-    st = state_io.load(config.STATE_PATH)
-    epoch = st.get("epoch", 1)
-    db = _db()
-    series = equity_series(db, epoch)
-    out = []
-    for p in STRATEGIES:
-        acc = st.get("accounts", {}).get(p.name, {})
-        stats = {"trades": 0, "win_rate": 0.0, "avg_r": 0.0, "profit_factor": None}
-        if db:
-            rows = db.execute("SELECT pnl_pct, r_multiple FROM trades WHERE epoch=? AND strategy=? "
-                              "AND closed_at IS NOT NULL", (epoch, p.name)).fetchall()
-            if rows:
-                gp = sum(r[0] for r in rows if r[0] > 0)
-                gl = -sum(r[0] for r in rows if r[0] < 0)
-                stats = {"trades": len(rows),
-                         "win_rate": round(100 * sum(1 for r in rows if r[0] > 0) / len(rows), 1),
-                         "avg_r": round(sum(r[1] or 0 for r in rows) / len(rows), 2),
-                         "profit_factor": round(gp / gl, 2) if gl else None}
-        ser = series.get(p.name, [])
-        out.append({
-            "name": p.name, "title": p.title, "description": p.description,
-            "return_pct": st.get("returns", {}).get(p.name, 0.0),
-            "max_dd_pct": _max_dd([v for _, v in ser]),
-            "open": len(acc.get("positions", [])), "max_positions": p.max_positions,
-            "risk_pct": p.risk_pct, "min_score": p.min_score,
-            "halted": bool(acc.get("halted_epoch")) or acc.get("halted_day") == acc.get("trading_day") and bool(acc.get("halted_day")),
-            "spark": [v for _, v in ser][-120:], **stats})
-    if db:
-        db.close()
-    out.sort(key=lambda x: -x["return_pct"])
-    return {"epoch": epoch, "strategies": out}
-
-
-def trades(strategy: str = "", limit: int = 100) -> dict:
-    st = state_io.load(config.STATE_PATH)
-    epoch = st.get("epoch", 1)
-    db = _db()
-    rows = []
-    shadows = []
-    if db:
-        q = ("SELECT id, strategy, instrument, direction, opened_at, closed_at, reason, score, risk_pct,"
-             " pnl_pct, swap_pct, r_multiple, spread_cost_pct FROM trades WHERE epoch=?")
-        args: list = [epoch]
-        if strategy:
-            q += " AND strategy=?"
-            args.append(strategy)
-        q += " ORDER BY COALESCE(closed_at, opened_at) DESC LIMIT ?"
-        args.append(int(limit))
-        rows = [dict(r) for r in db.execute(q, args)]
-        for lo in range(50, 100, 10):
-            rs = [r[0] for r in db.execute(
-                "SELECT r FROM shadows WHERE epoch=? AND r IS NOT NULL AND score>=? AND score<?",
-                (epoch, lo, lo + 10))]
-            if rs:
-                shadows.append({"bucket": f"{lo}-{lo + 9}", "n": len(rs),
-                                "win_rate": round(100 * sum(1 for r in rs if r > 0) / len(rs), 1),
-                                "avg_r": round(sum(rs) / len(rs), 3)})
-        db.close()
-    return {"epoch": epoch, "trades": rows, "open_positions": st.get("open_positions", []),
-            "shadows": shadows}
-
-
-RULE_GROUPS = [
-    ("Scout", ["SCOUT_MIN_ATR_RATIO", "SCOUT_OFFSESSION_ATR_RATIO", "SCOUT_MAX_CANDIDATES"]),
-    ("Filter", ["FILTER_MAX_SPREAD_ATR", "FILTER_MAX_SPREAD_X_TYPICAL", "FILTER_NEWS_WINDOW_MIN",
-                "FILTER_MIN_ATR_RATIO", "FILTER_MAX_DATA_AGE_MIN", "ROLLOVER_BLACKOUT_MIN"]),
-    ("Analyst", ["EMA_FAST", "EMA_SLOW", "RSI_LEN", "ATR_LEN", "TREND_TF_WEIGHTS", "CORR_MIN",
-                 "DEFAULT_WEIGHTS", "CARRY_FULL_SCALE_PCT", "POLICY_RATES"]),
-    ("Risk", ["STOP_ATR_MULT", "TRAIL_ATR_MULT", "TRAIL_ACTIVATE_R", "TAKE_PROFIT_R", "MAX_CCY_RISK_PCT",
-              "MAX_CCY_NOTIONAL_X", "MAX_CORRELATED_POSITIONS", "CORR_HIGH", "DAILY_LOSS_CAP_PCT",
-              "MAX_DRAWDOWN_HALT_PCT"]),
-    ("Executor", ["RISK_PER_TRADE_PCT", "MAX_OPEN_POSITIONS", "QUARANTINE_MIN", "SLIPPAGE_SPREAD_FRAC",
-                  "SWAP_MARKUP_PCT", "CLOSE_BEFORE_WEEKEND_MIN", "MAX_HOLD_HOURS"]),
-    ("Skyggehandler", ["SHADOW_MIN_SCORE", "SHADOW_STOP_ATR", "SHADOW_TP_R", "SHADOW_MAX_HOURS"]),
+RULE_LABELS = [
+    ("Marked", [("SCAN_INTERVAL_MINUTES", "Minutter mellem cyklusser"),
+                ("NO_TRADE_FIRST_MINUTES", "Ingen handler de første minutter"),
+                ("PREP_MINUTES_BEFORE_OPEN", "Forberedelse før åbning (min)"),
+                ("HALT_STALE_SECONDS", "Ingen handler i (sek) ⇒ betragtes som stoppet")]),
+    ("Scout", [("SCOUT_MIN_RVOL", "Min. relativ volumen"), ("SCOUT_GAP_PCT", "Gap op/ned (andel)"),
+               ("SCOUT_HIGH52_TOLERANCE", "Tolerance for ny 52-ugers top"),
+               ("SCOUT_EXTRA_SIGNALS", "Ekstra signaler (pullback/oversold)"),
+               ("SCOUT_MAX_CANDIDATES", "Maks. kandidater pr. cyklus")]),
+    ("Filter", [("MIN_PRICE", "Min. kurs (USD)"), ("MIN_AVG_VOLUME", "Min. gns. volumen (aktier/dag)"),
+                ("MIN_AVG_DOLLAR_VOLUME", "Min. gns. omsætning (USD/dag)"),
+                ("MAX_SPREAD_PCT", "Maks. spread (andel af midtkurs)"),
+                ("SPREAD_UNKNOWN_ALLOWED", "Tillad ukendt spread"),
+                ("EARNINGS_BLACKOUT_DAYS", "Ingen køb X dage før earnings"),
+                ("MIN_HISTORY_BARS", "Min. antal dagsbarer")]),
+    ("Analyst", [("SCORE_WEIGHTS", "Score-vægte"), ("IDEAL_ATR_PCT", "Ideelt ATR-bånd")]),
+    ("Risk", [("ATR_STOP_MULT", "Stop = entry − k×ATR"), ("ATR_TRAIL_MULT", "Trailing = top − k×ATR"),
+              ("MAX_STOP_PCT", "Maks. stopafstand"), ("MAX_SECTOR_PCT", "Maks. andel pr. sektor"),
+              ("MAX_HOLD_DAYS", "Maks. holdetid (handelsdage)")]),
+    ("Executor", [("POSITION_PCT", "Andel af konto pr. handel"), ("MAX_OPEN_POSITIONS", "Maks. åbne positioner"),
+                  ("SLIPPAGE_BPS", "Slippage (basispoint, + halv spread)"),
+                  ("COMMISSION_PER_SHARE", "Kommission pr. aktie (USD)"), ("COMMISSION_MIN", "Min. kommission (USD)"),
+                  ("QUARANTINE_DAYS", "Karantæne efter salg (dage)")]),
+    ("Drift", [("EPOCH", "Epoch (hæv for at nulstille)")]),
 ]
 
 
-def rules() -> dict:
-    groups = [{"name": g, "items": [{"key": k, "value": getattr(config, k)} for k in keys]}
-              for g, keys in RULE_GROUPS]
-    strats = []
-    for p in STRATEGIES:
-        d = {k: v for k, v in p.__dict__.items() if v not in ((), 0.0, False, None, "") or k == "tp_r"}
-        strats.append(d)
-    return {"groups": groups, "strategies": strats, "instruments": list(config.INSTRUMENTS)}
+def _downsample(rows: list, n: int = 240) -> list:
+    if len(rows) <= n:
+        return rows
+    step = len(rows) / n
+    out = [rows[int(i * step)] for i in range(n)]
+    out[-1] = rows[-1]
+    return out
 
 
-ROUTES = {"/api/overview": overview, "/api/strategies": strategies, "/api/rules": rules}
+class Api:
+    def __init__(self, cfg=_cfg):
+        self.cfg = cfg
+        self.clock = MarketClock(cfg)
 
+    def state(self) -> dict:
+        p = Path(self.cfg.STATE_FILE)
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except ValueError:
+                pass
+        return {"epoch": self.cfg.EPOCH, "accounts": {}, "meta": {}, "start_equity": self.cfg.START_EQUITY}
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "desk/1.0"
+    def db(self):
+        p = Path(self.cfg.DB_FILE)
+        if not p.exists():
+            return None
+        c = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+        c.row_factory = sqlite3.Row
+        return c
 
-    def log_message(self, *a):  # stille i journalen
-        pass
+    # --- endpoints ------------------------------------------------------------------
+    def status(self) -> dict:
+        st = self.clock.status()
+        dk = ZoneInfo(self.cfg.DISPLAY_TZ)
+        s = self.state()
+        days = ["man", "tir", "ons", "tor", "fre", "lør", "søn"]
+        fmt = lambda d: f"{days[d.weekday()]} {d:%d.%m %H:%M}" if d else None  # noqa: E731
+        return {
+            "session": st.session, "label": st.label, "holiday": st.holiday, "early_close": st.early_close,
+            "next_open_et": fmt(st.next_open), "next_open_dk": fmt(st.next_open.astimezone(dk)),
+            "next_close_et": fmt(st.next_close), "next_close_dk": fmt(st.next_close.astimezone(dk)) if st.next_close else None,
+            "now_et": fmt(st.now_market), "now_dk": fmt(st.now_market.astimezone(dk)),
+            "epoch": s.get("epoch"), "config_epoch": self.cfg.EPOCH, "meta": s.get("meta", {}),
+            "paper_only": True,
+        }
 
-    def _send(self, code: int, body: bytes, ctype: str):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def _account_stats(self, s: dict, name: str, acct: dict) -> dict:
+        start = s.get("start_equity") or 1
+        pos_val = sum(p["qty"] * p.get("last", p["entry"]) for p in acct["positions"].values())
+        eq = acct["cash"] + pos_val
+        return {"return_pct": (eq / start - 1) * 100, "exposure_pct": pos_val / eq * 100 if eq else 0,
+                "open": len(acct["positions"]), "trades": acct.get("trades", 0),
+                "win_rate": acct["wins"] / acct["trades"] * 100 if acct.get("trades") else None,
+                "max_dd": acct.get("max_dd", 0.0)}
 
-    def do_GET(self):
-        u = urlparse(self.path)
+    def series(self, conn, epoch) -> dict[str, list]:
+        out: dict[str, list] = {}
+        if conn is None:
+            return out
+        rows = conn.execute("SELECT strategy, ts, return_pct FROM equity WHERE epoch=? ORDER BY id", (epoch,)).fetchall()
+        for r in rows:
+            out.setdefault(r["strategy"], []).append([r["ts"], round(r["return_pct"], 4)])
+        return {k: _downsample(v) for k, v in out.items()}
+
+    def overview(self) -> dict:
+        s = self.state()
+        conn = self.db()
         try:
-            if u.path in ("/", "/index.html"):
-                return self._send(200, WEB.read_bytes(), "text/html; charset=utf-8")
-            if u.path == "/api/trades":
-                qs = parse_qs(u.query)
-                data = trades(qs.get("strategy", [""])[0], int(qs.get("limit", ["100"])[0]))
-            elif u.path in ROUTES:
-                data = ROUTES[u.path]()
-            elif u.path == "/healthz":
-                return self._send(200, b"ok", "text/plain")
-            else:
+            series = self.series(conn, s.get("epoch"))
+            events = [dict(r) for r in conn.execute(
+                "SELECT ts, agent, level, message FROM events WHERE epoch=? ORDER BY id DESC LIMIT 15",
+                (s.get("epoch"),))] if conn else []
+        finally:
+            conn and conn.close()
+        if not series:  # fald tilbage til daglig historik i papirbogen
+            series = {n: a.get("history", []) for n, a in s.get("accounts", {}).items()}
+        stats = {n: self._account_stats(s, n, a) for n, a in s.get("accounts", {}).items()}
+        labels = {st.name: st.label for st in STRATEGIES}
+        return {"stats": stats, "series": series, "labels": labels, "events": events}
+
+    def strategies(self) -> dict:
+        ov = self.overview()
+        out = []
+        for st in STRATEGIES:
+            out.append({"name": st.name, "label": st.label, "description": st.description,
+                        **(ov["stats"].get(st.name) or {}), "series": ov["series"].get(st.name, [])})
+        bt = None
+        p = Path(self.cfg.BACKTEST_RESULTS)
+        if p.exists():
+            try:
+                bt = json.loads(p.read_text())
+            except ValueError:
+                bt = None
+        return {"strategies": out, "backtest": bt}
+
+    def trades(self) -> dict:
+        s = self.state()
+        labels = {st.name: st.label for st in STRATEGIES}
+        start = s.get("start_equity") or 1
+        positions = []
+        for name, a in s.get("accounts", {}).items():
+            eq = a["cash"] + sum(p["qty"] * p.get("last", p["entry"]) for p in a["positions"].values())
+            for sym, p in a["positions"].items():
+                last = p.get("last", p["entry"])
+                stop = max(p["stop"], p.get("trail") or 0)
+                positions.append({"strategy": labels.get(name, name), "symbol": sym, "opened": p["opened"][:10],
+                                  "entry": round(p["entry"], 2), "last": round(last, 2),
+                                  "unreal_pct": (p["qty"] * last / p["cost"] - 1) * 100 if p["cost"] else 0,
+                                  "weight_pct": p["qty"] * last / eq * 100 if eq else 0,
+                                  "stop_dist_pct": (last / stop - 1) * 100 if stop else None,
+                                  "sector": p.get("sector")})
+        positions.sort(key=lambda x: x["opened"], reverse=True)
+        conn = self.db()
+        closed, shadow = [], {}
+        try:
+            if conn:
+                closed = [dict(r) for r in conn.execute(
+                    "SELECT ts, strategy, symbol, side, price, reason, pnl_pct, hold_days, weight_pct FROM trades "
+                    "WHERE epoch=? ORDER BY id DESC LIMIT 200", (s.get("epoch"),))]
+                for r in closed:
+                    r["strategy"] = labels.get(r["strategy"], r["strategy"])
+                rows = conn.execute(
+                    "SELECT MIN(CAST(score/10 AS INT)*10, 90) AS b, COUNT(*) n, AVG(ret_1) r1, AVG(ret_5) r5, AVG(ret_10) r10, "
+                    "AVG(CASE WHEN ret_5>0 THEN 1.0 ELSE 0 END) hit FROM shadow WHERE epoch=? GROUP BY b ORDER BY b DESC",
+                    (s.get("epoch"),)).fetchall()
+                shadow = {"buckets": [dict(r) for r in rows],
+                          "recent": [dict(r) for r in conn.execute(
+                              "SELECT day, symbol, score, signals, ret_1, ret_5, ret_10 FROM shadow WHERE epoch=? "
+                              "ORDER BY id DESC LIMIT 60", (s.get("epoch"),))]}
+        finally:
+            conn and conn.close()
+        return {"positions": positions, "closed": closed, "shadow": shadow, "start_known": bool(start)}
+
+    def rules(self) -> dict:
+        groups = []
+        for title, items in RULE_LABELS:
+            groups.append({"title": title, "items": [{"key": k, "label": lbl, "value": getattr(self.cfg, k, None)}
+                                                    for k, lbl in items]})
+        strats = []
+        for st in STRATEGIES:
+            strats.append({
+                "label": st.label, "description": st.description, "entry": st.entry_text,
+                "exit": st.exit_text or "Kun stop/trailing/holdetid", "signals": sorted(st.signals) or ["alle"],
+                "min_score": st.min_score, "position_pct": st.p("position_pct", self.cfg) * 100,
+                "max_positions": st.p("max_positions", self.cfg), "atr_stop": st.p("atr_stop", self.cfg),
+                "atr_trail": st.p("atr_trail", self.cfg), "max_hold_days": st.p("max_hold_days", self.cfg),
+                "take_profit_atr": st.take_profit_atr, "universe": st.universe,
+                "spy_filter": st.require_spy_uptrend})
+        return {"groups": groups, "strategies": strats}
+
+
+def make_handler(api: Api):
+    routes = {"/api/status": api.status, "/api/overview": api.overview, "/api/strategies": api.strategies,
+              "/api/trades": api.trades, "/api/rules": api.rules}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # stille
+            pass
+
+        def _send(self, code: int, body: bytes, ctype: str):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                return self._send(200, (STATIC / "index.html").read_bytes(), "text/html; charset=utf-8")
+            fn = routes.get(path)
+            if fn is None:
                 return self._send(404, b"ikke fundet", "text/plain; charset=utf-8")
-            body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-            return self._send(200, body, "application/json; charset=utf-8")
-        except Exception as e:  # noqa: BLE001
-            return self._send(500, json.dumps({"fejl": str(e)}).encode(), "application/json")
+            try:
+                body = json.dumps(fn(), default=str).encode()
+                self._send(200, body, "application/json; charset=utf-8")
+            except Exception as e:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+    return H
 
 
-def make_server(host: str = None, port: int = None) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host or config.DASHBOARD_HOST, port or config.DASHBOARD_PORT), Handler)
+def make_server(cfg=_cfg, host: str | None = None, port: int | None = None) -> ThreadingHTTPServer:
+    api = Api(cfg)
+    return ThreadingHTTPServer((host or cfg.DASHBOARD_HOST, cfg.DASHBOARD_PORT if port is None else port),
+                               make_handler(api))
 
 
-def serve(host: str = None, port: int = None) -> None:
-    srv = make_server(host, port)
-    print(f"Dashboard: http://{srv.server_address[0]}:{srv.server_address[1]}")
+def serve(cfg=_cfg):
+    srv = make_server(cfg)
+    print(f"Dashboard: http://{cfg.DASHBOARD_HOST}:{cfg.DASHBOARD_PORT}  ({datetime.now(timezone.utc):%H:%M} UTC)",
+          flush=True)
     srv.serve_forever()
+
+
+if __name__ == "__main__":
+    serve()
